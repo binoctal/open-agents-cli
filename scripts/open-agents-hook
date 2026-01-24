@@ -1,0 +1,42 @@
+#!/bin/bash
+# open-agents-hook - Permission hook script for AI CLI tools
+# This script is called by CLI tools (kiro, cline) before executing sensitive operations
+
+set -e
+
+SOCKET_PATH="${OPEN_AGENTS_SOCKET_DIR:-/tmp}/open-agents.sock"
+
+# Read JSON from stdin
+read -r input
+
+# Extract tool info
+tool_name=$(echo "$input" | jq -r '.tool_name // .toolName // "unknown"')
+tool_input=$(echo "$input" | jq -c '.tool_input // .toolInput // {}')
+session_id="${OPEN_AGENTS_SESSION_ID:-default}"
+
+# Build request
+request=$(jq -n \
+  --arg type "permission" \
+  --arg toolName "$tool_name" \
+  --argjson toolInput "$tool_input" \
+  --arg sessionId "$session_id" \
+  '{type: $type, toolName: $toolName, toolInput: $toolInput, sessionId: $sessionId}')
+
+# Check if socket exists
+if [ ! -S "$SOCKET_PATH" ]; then
+  echo "Warning: Bridge not running, auto-approving" >&2
+  exit 0
+fi
+
+# Send to bridge and get response
+response=$(echo "$request" | nc -U "$SOCKET_PATH" 2>/dev/null || echo '{"approved":true}')
+
+# Parse response
+approved=$(echo "$response" | jq -r '.approved // true')
+
+if [ "$approved" = "true" ]; then
+  exit 0
+else
+  echo "Permission denied by user" >&2
+  exit 2
+fi
