@@ -4,9 +4,11 @@ import (
 	"bufio"
 	"encoding/json"
 	"fmt"
+	"log"
 	"net"
 	"os"
 	"path/filepath"
+	"time"
 )
 
 const SocketName = "open-agents.sock"
@@ -94,11 +96,12 @@ func (s *Server) handleConn(conn net.Conn) {
 
 	var req HookRequest
 	if err := json.Unmarshal(scanner.Bytes(), &req); err != nil {
+		log.Printf("Failed to parse permission request: %v", err)
 		return
 	}
 
 	permReq := Request{
-		ID:             fmt.Sprintf("perm_%d", os.Getpid()),
+		ID:             fmt.Sprintf("perm_%d_%d", os.Getpid(), time.Now().UnixNano()),
 		SessionID:      req.SessionID,
 		PermissionType: toolToPermissionType(req.ToolName),
 		Description:    buildDescription(req.ToolName, req.ToolInput),

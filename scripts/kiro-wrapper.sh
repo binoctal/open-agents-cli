@@ -4,7 +4,7 @@
 # This script intercepts kiro-cli commands and sends permission requests
 
 SOCKET_PATH="/tmp/open-agents.sock"
-REAL_KIRO=$(which kiro-cli 2>/dev/null || echo "/usr/local/bin/kiro-cli")
+REAL_KIRO="$HOME/.local/bin/kiro-cli-real"
 
 # Check if Bridge is running
 if [ ! -S "$SOCKET_PATH" ]; then
@@ -16,25 +16,16 @@ fi
 COMMAND="$*"
 SESSION_ID="session_$(date +%s)"
 
-# Detect if this is a tool-using command (simple heuristic)
-if echo "$COMMAND" | grep -qE "file|write|read|execute|aws|bash"; then
+# Detect if this is a tool-using command
+# Intercept all chat commands for permission
+if echo "$COMMAND" | grep -qE "chat|file|write|read|execute|aws|bash|创建|删除|修改"; then
   echo "🔒 Requesting permission from Open Agents..."
   
   # Send permission request to Bridge
-  REQUEST=$(cat <<EOF
-{
-  "type": "tool_request",
-  "toolName": "kiro_command",
-  "toolInput": {
-    "command": "$COMMAND"
-  },
-  "sessionId": "$SESSION_ID"
-}
-EOF
-)
+  REQUEST="{\"type\":\"permission_request\",\"toolName\":\"kiro_command\",\"toolInput\":{\"command\":\"$COMMAND\"},\"sessionId\":\"$SESSION_ID\"}"
   
   # Send to Unix socket and wait for response
-  RESPONSE=$(echo "$REQUEST" | nc -U "$SOCKET_PATH" -W 30)
+  RESPONSE=$(printf '%s\n' "$REQUEST" | nc -U "$SOCKET_PATH" -W 30)
   
   if echo "$RESPONSE" | grep -q '"approved":true'; then
     echo "✅ Permission approved. Executing..."

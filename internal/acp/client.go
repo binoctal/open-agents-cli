@@ -3,7 +3,6 @@ package acp
 import (
 	"bufio"
 	"encoding/json"
-	"fmt"
 	"io"
 	"log"
 	"os/exec"

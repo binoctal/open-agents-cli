@@ -158,14 +158,14 @@ func (b *Bridge) readLoop() {
 		default:
 			_, data, err := b.conn.ReadMessage()
 			if err != nil {
-				log.Printf("Read error: %v", err)
+				log.Printf("WebSocket read error: %v", err)
 				b.reconnect()
 				continue
 			}
 
 			var msg Message
 			if err := json.Unmarshal(data, &msg); err != nil {
-				log.Printf("Parse error: %v", err)
+				log.Printf("Failed to parse message: %v", err)
 				continue
 			}
 
@@ -175,8 +175,6 @@ func (b *Bridge) readLoop() {
 }
 
 func (b *Bridge) handleMessage(msg Message) {
-	log.Printf("Received: %s", msg.Type)
-
 	switch msg.Type {
 	case "session:send":
 		b.handleSessionSend(msg)
@@ -212,13 +210,13 @@ func (b *Bridge) handleSessionSend(msg Message) {
 func (b *Bridge) handlePermissionResponse(msg Message) {
 	payload, ok := msg.Payload.(map[string]interface{})
 	if !ok {
+		log.Printf("Invalid permission response payload")
 		return
 	}
 
 	id, _ := payload["id"].(string)
 	approved, _ := payload["approved"].(bool)
 
-	log.Printf("Permission %s: approved=%v", id, approved)
 	b.permHandler.Resolve(permission.Response{
 		ID:       id,
 		Approved: approved,
