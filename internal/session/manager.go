@@ -8,9 +8,12 @@ import (
 	"github.com/open-agents/bridge/internal/adapter"
 )
 
+type OutputCallback func(sessionID, outputType, content string)
+
 type Manager struct {
-	sessions map[string]*Session
-	mu       sync.RWMutex
+	sessions       map[string]*Session
+	mu             sync.RWMutex
+	outputCallback OutputCallback
 }
 
 type Session struct {
@@ -26,6 +29,10 @@ func NewManager() *Manager {
 	return &Manager{
 		sessions: make(map[string]*Session),
 	}
+}
+
+func (m *Manager) SetOutputCallback(callback OutputCallback) {
+	m.outputCallback = callback
 }
 
 func (m *Manager) Create(cliType, workDir string) (*Session, error) {
@@ -44,6 +51,13 @@ func (m *Manager) Create(cliType, workDir string) (*Session, error) {
 		Status:    "active",
 		Adapter:   adp,
 		CreatedAt: time.Now(),
+	}
+
+	// Set up output callback
+	if m.outputCallback != nil {
+		adp.OnOutput(func(event adapter.OutputEvent) {
+			m.outputCallback(sess.ID, event.Type, event.Content)
+		})
 	}
 
 	if err := adp.Start(workDir, nil); err != nil {

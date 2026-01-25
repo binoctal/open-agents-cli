@@ -83,6 +83,20 @@ func (b *Bridge) Start() error {
 		})
 	})
 
+	// Set up session output forwarding
+	b.sessions.SetOutputCallback(func(sessionID, outputType, content string) {
+		b.sendMessage(Message{
+			Type: "session:output",
+			Payload: map[string]interface{}{
+				"sessionId":  sessionID,
+				"deviceId":   b.config.DeviceID,
+				"outputType": outputType,
+				"content":    content,
+			},
+			Timestamp: time.Now().UnixMilli(),
+		})
+	})
+
 	if err := b.connect(); err != nil {
 		return err
 	}
@@ -176,14 +190,66 @@ func (b *Bridge) readLoop() {
 
 func (b *Bridge) handleMessage(msg Message) {
 	switch msg.Type {
+	case "session:start":
+		b.handleSessionStart(msg)
 	case "session:send":
 		b.handleSessionSend(msg)
+	case "session:stop":
+		b.handleSessionStop(msg)
 	case "permission:response":
 		b.handlePermissionResponse(msg)
 	case "control:takeover":
 		b.handleControlTakeover(msg)
 	default:
 		log.Printf("Unknown message type: %s", msg.Type)
+	}
+}
+
+func (b *Bridge) handleSessionStart(msg Message) {
+	payload, ok := msg.Payload.(map[string]interface{})
+	if !ok {
+		return
+	}
+
+	cliType, _ := payload["cliType"].(string)
+	workDir, _ := payload["workDir"].(string)
+	initialCommand, _ := payload["command"].(string)
+
+	if cliType == "" {
+		cliType = "kiro" // default
+	}
+	if workDir == "" {
+		workDir = "."
+	}
+
+	sess, err := b.sessions.Create(cliType, workDir)
+	if err != nil {
+		log.Printf("Failed to create session: %v", err)
+		b.sendMessage(Message{
+			Type: "session:error",
+			Payload: map[string]interface{}{
+				"error": err.Error(),
+			},
+			Timestamp: time.Now().UnixMilli(),
+		})
+		return
+	}
+
+	// Send session started notification
+	b.sendMessage(Message{
+		Type: "session:started",
+		Payload: map[string]interface{}{
+			"sessionId": sess.ID,
+			"deviceId":  b.config.DeviceID,
+			"cliType":   cliType,
+			"workDir":   workDir,
+		},
+		Timestamp: time.Now().UnixMilli(),
+	})
+
+	// Send initial command if provided
+	if initialCommand != "" {
+		sess.Send(initialCommand)
 	}
 }
 
@@ -205,6 +271,28 @@ func (b *Bridge) handleSessionSend(msg Message) {
 	if err := sess.Send(content); err != nil {
 		log.Printf("Send error: %v", err)
 	}
+}
+
+func (b *Bridge) handleSessionStop(msg Message) {
+	payload, ok := msg.Payload.(map[string]interface{})
+	if !ok {
+		return
+	}
+
+	sessionID, _ := payload["sessionId"].(string)
+	if err := b.sessions.Stop(sessionID); err != nil {
+		log.Printf("Failed to stop session: %v", err)
+	}
+
+	// Send session stopped notification
+	b.sendMessage(Message{
+		Type: "session:stopped",
+		Payload: map[string]interface{}{
+			"sessionId": sessionID,
+			"deviceId":  b.config.DeviceID,
+		},
+		Timestamp: time.Now().UnixMilli(),
+	})
 }
 
 func (b *Bridge) handlePermissionResponse(msg Message) {
