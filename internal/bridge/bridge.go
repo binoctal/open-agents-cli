@@ -12,24 +12,29 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
+	"github.com/open-agents/bridge/internal/api"
 	"github.com/open-agents/bridge/internal/config"
 	"github.com/open-agents/bridge/internal/crypto"
 	"github.com/open-agents/bridge/internal/permission"
+	"github.com/open-agents/bridge/internal/rules"
 	"github.com/open-agents/bridge/internal/session"
 	"github.com/open-agents/bridge/internal/storage"
 )
 
 type Bridge struct {
-	config      *config.Config
-	conn        *websocket.Conn
-	sessions    *session.Manager
-	permServer  *permission.Server
-	permHandler *permission.Handler
-	store       *storage.Store
-	keyPair     *crypto.KeyPair
-	webPubKey   *[crypto.KeySize]byte
-	done        chan struct{}
-	mu          sync.Mutex
+	config       *config.Config
+	conn         *websocket.Conn
+	sessions     *session.Manager
+	permServer   *permission.Server
+	permHandler  *permission.Handler
+	store        *storage.Store
+	s3Uploader   *storage.S3Uploader
+	rulesEngine  *rules.Engine
+	apiClient    *api.Client
+	keyPair      *crypto.KeyPair
+	webPubKey    *[crypto.KeySize]byte
+	done         chan struct{}
+	mu           sync.Mutex
 }
 
 func New(cfg *config.Config) (*Bridge, error) {
@@ -45,7 +50,14 @@ func New(cfg *config.Config) (*Bridge, error) {
 		permHandler: handler,
 		permServer:  permission.NewServer(handler),
 		store:       store,
+		rulesEngine: rules.NewEngine(cfg.Rules),
+		apiClient:   api.NewClient(cfg),
 		done:        make(chan struct{}),
+	}
+
+	// Initialize S3 uploader if configured
+	if cfg.S3Config != nil {
+		b.s3Uploader = storage.NewS3Uploader(cfg.S3Config)
 	}
 
 	// Load E2EE keys if available
@@ -73,9 +85,39 @@ func (b *Bridge) Start() error {
 		log.Printf("Warning: Could not start permission server: %v", err)
 	}
 
-	// Set up permission request forwarding
+	// Sync rules from API on startup
+	go b.syncRulesFromAPI()
+
+	// Set up permission request forwarding with rules engine
 	b.permHandler.OnRequest(func(req permission.Request) {
 		req.DeviceID = b.config.DeviceID
+
+		// Check auto-approval rules
+		path := ""
+		command := ""
+		if req.Detail != nil {
+			if p, ok := req.Detail["path"].(string); ok {
+				path = p
+			}
+			if c, ok := req.Detail["command"].(string); ok {
+				command = c
+			}
+		}
+
+		action, ruleID := b.rulesEngine.Evaluate(req.PermissionType, path, command)
+
+		switch action {
+		case "auto-approve":
+			log.Printf("Auto-approved by rule %s: %s", ruleID, req.Description)
+			b.permHandler.Resolve(permission.Response{ID: req.ID, Approved: true})
+			return
+		case "deny":
+			log.Printf("Auto-denied by rule %s: %s", ruleID, req.Description)
+			b.permHandler.Resolve(permission.Response{ID: req.ID, Approved: false})
+			return
+		}
+
+		// Default: forward to Web for user decision
 		b.sendMessage(Message{
 			Type:      "permission:request",
 			Payload:   req,
@@ -93,6 +135,23 @@ func (b *Bridge) Start() error {
 				"outputType": outputType,
 				"content":    content,
 			},
+			Timestamp: time.Now().UnixMilli(),
+		})
+	})
+
+	// Set up chat response forwarding
+	b.sessions.SetChatCallback(func(sessionID, content string, codeBlock *session.CodeBlock) {
+		payload := map[string]interface{}{
+			"sessionId": sessionID,
+			"deviceId":  b.config.DeviceID,
+			"content":   content,
+		}
+		if codeBlock != nil {
+			payload["codeBlock"] = codeBlock
+		}
+		b.sendMessage(Message{
+			Type:      "chat:response",
+			Payload:   payload,
 			Timestamp: time.Now().UnixMilli(),
 		})
 	})
@@ -196,10 +255,18 @@ func (b *Bridge) handleMessage(msg Message) {
 		b.handleSessionSend(msg)
 	case "session:stop":
 		b.handleSessionStop(msg)
+	case "chat:send":
+		b.handleChatSend(msg)
 	case "permission:response":
 		b.handlePermissionResponse(msg)
 	case "control:takeover":
 		b.handleControlTakeover(msg)
+	case "config:sync":
+		b.handleConfigSync(msg)
+	case "rules:sync":
+		b.handleRulesSync(msg)
+	case "storage:sync":
+		b.handleStorageSync(msg)
 	default:
 		log.Printf("Unknown message type: %s", msg.Type)
 	}
@@ -319,7 +386,164 @@ func (b *Bridge) handleControlTakeover(msg Message) {
 
 	sessionID, _ := payload["sessionId"].(string)
 	log.Printf("Control takeover for session: %s", sessionID)
-	// TODO: Implement control takeover
+}
+
+func (b *Bridge) handleConfigSync(msg Message) {
+	payload, ok := msg.Payload.(map[string]interface{})
+	if !ok {
+		return
+	}
+
+	// Sync environment variables
+	if envVars, ok := payload["envVars"].(map[string]interface{}); ok {
+		b.config.EnvVars = make(map[string]string)
+		for k, v := range envVars {
+			if s, ok := v.(string); ok {
+				b.config.EnvVars[k] = s
+			}
+		}
+		// Apply to current process
+		for k, v := range b.config.EnvVars {
+			os.Setenv(k, v)
+		}
+		log.Printf("Synced %d environment variables", len(b.config.EnvVars))
+	}
+
+	// Sync CLI enabled status
+	if cliEnabled, ok := payload["cliEnabled"].(map[string]interface{}); ok {
+		b.config.CLIEnabled = make(map[string]bool)
+		for k, v := range cliEnabled {
+			if bv, ok := v.(bool); ok {
+				b.config.CLIEnabled[k] = bv
+			}
+		}
+		log.Printf("Synced CLI enabled: %v", b.config.CLIEnabled)
+	}
+
+	// Sync permissions
+	if perms, ok := payload["permissions"].(map[string]interface{}); ok {
+		b.config.Permissions = make(map[string]bool)
+		for k, v := range perms {
+			if bv, ok := v.(bool); ok {
+				b.config.Permissions[k] = bv
+			}
+		}
+		log.Printf("Synced permissions: %v", b.config.Permissions)
+	}
+
+	// Save config
+	if err := config.Save(b.config); err != nil {
+		log.Printf("Failed to save config: %v", err)
+	}
+
+	// Send ack
+	b.sendMessage(Message{
+		Type:      "config:synced",
+		Payload:   map[string]string{"deviceId": b.config.DeviceID},
+		Timestamp: time.Now().UnixMilli(),
+	})
+}
+
+func (b *Bridge) handleRulesSync(msg Message) {
+	payload, ok := msg.Payload.(map[string]interface{})
+	if !ok {
+		return
+	}
+
+	rulesData, ok := payload["rules"].([]interface{})
+	if !ok {
+		return
+	}
+
+	var newRules []config.AutoApprovalRule
+	for _, r := range rulesData {
+		if ruleMap, ok := r.(map[string]interface{}); ok {
+			rule := config.AutoApprovalRule{
+				ID:      getString(ruleMap, "id"),
+				Pattern: getString(ruleMap, "pattern"),
+				Tool:    getString(ruleMap, "tool"),
+				Action:  getString(ruleMap, "action"),
+			}
+			newRules = append(newRules, rule)
+		}
+	}
+
+	b.config.Rules = newRules
+	b.rulesEngine.UpdateRules(newRules)
+	config.Save(b.config)
+
+	log.Printf("Synced %d auto-approval rules", len(newRules))
+
+	b.sendMessage(Message{
+		Type:      "rules:synced",
+		Payload:   map[string]interface{}{"deviceId": b.config.DeviceID, "count": len(newRules)},
+		Timestamp: time.Now().UnixMilli(),
+	})
+}
+
+func (b *Bridge) handleStorageSync(msg Message) {
+	payload, ok := msg.Payload.(map[string]interface{})
+	if !ok {
+		return
+	}
+
+	storageType, _ := payload["storageType"].(string)
+	b.config.StorageType = storageType
+
+	if storageType == "s3" {
+		if s3Data, ok := payload["s3Config"].(map[string]interface{}); ok {
+			b.config.S3Config = &config.S3Config{
+				Bucket:    getString(s3Data, "bucket"),
+				Region:    getString(s3Data, "region"),
+				AccessKey: getString(s3Data, "accessKey"),
+				SecretKey: getString(s3Data, "secretKey"),
+				Endpoint:  getString(s3Data, "endpoint"),
+			}
+			b.s3Uploader = storage.NewS3Uploader(b.config.S3Config)
+		}
+	}
+
+	config.Save(b.config)
+	log.Printf("Storage type set to: %s", storageType)
+
+	b.sendMessage(Message{
+		Type:      "storage:synced",
+		Payload:   map[string]string{"deviceId": b.config.DeviceID, "storageType": storageType},
+		Timestamp: time.Now().UnixMilli(),
+	})
+}
+
+func getString(m map[string]interface{}, key string) string {
+	if v, ok := m[key].(string); ok {
+		return v
+	}
+	return ""
+}
+
+func (b *Bridge) handleChatSend(msg Message) {
+	payload, ok := msg.Payload.(map[string]interface{})
+	if !ok {
+		return
+	}
+
+	sessionID, _ := payload["sessionId"].(string)
+	content, _ := payload["content"].(string)
+
+	log.Printf("Chat message for session %s: %s", sessionID, content)
+
+	sess := b.sessions.Get(sessionID)
+	if sess == nil {
+		var err error
+		sess, err = b.sessions.Create("kiro", ".")
+		if err != nil {
+			log.Printf("Failed to create session: %v", err)
+			return
+		}
+	}
+
+	if err := sess.Send(content); err != nil {
+		log.Printf("Failed to send to CLI: %v", err)
+	}
 }
 
 func (b *Bridge) sendMessage(msg Message) error {
@@ -386,6 +610,43 @@ func getDeviceName() string {
 		return "Unknown Device"
 	}
 	return hostname
+}
+
+// syncRulesFromAPI fetches permission rules from API and updates local config
+func (b *Bridge) syncRulesFromAPI() {
+	rules, err := b.apiClient.GetPermissionRules("")
+	if err != nil {
+		log.Printf("Failed to sync rules from API: %v", err)
+		return
+	}
+
+	var configRules []config.AutoApprovalRule
+	for _, r := range rules {
+		configRules = append(configRules, config.AutoApprovalRule{
+			ID:      r.ID,
+			Pattern: r.Pattern,
+			Tool:    r.Tool,
+			Action:  r.Action,
+		})
+	}
+
+	b.config.Rules = configRules
+	b.rulesEngine.UpdateRules(configRules)
+	config.Save(b.config)
+	log.Printf("Synced %d rules from API", len(configRules))
+}
+
+// ReportSessionToAPI reports session status to API
+func (b *Bridge) ReportSessionToAPI(sessionID, cliType, workDir, status string) {
+	err := b.apiClient.ReportSession(api.SessionReport{
+		SessionID: sessionID,
+		CLIType:   cliType,
+		WorkDir:   workDir,
+		Status:    status,
+	})
+	if err != nil {
+		log.Printf("Failed to report session to API: %v", err)
+	}
 }
 
 // Message represents a WebSocket message
