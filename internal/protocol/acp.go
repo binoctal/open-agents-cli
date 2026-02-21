@@ -5,10 +5,14 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"os/exec"
+	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/open-agents/bridge/internal/logger"
 )
@@ -24,6 +28,7 @@ type ACPAdapter struct {
 	requestID atomic.Int64
 	mu        sync.Mutex
 	sessionID string
+	workDir   string
 }
 
 // NewACPAdapter creates a new ACP adapter
@@ -44,6 +49,9 @@ func (a *ACPAdapter) Connect(config AdapterConfig) error {
 	defer a.mu.Unlock()
 
 	logger.Info("[ACP] Connecting to %s in %s", config.Command, config.WorkDir)
+
+	// Store work directory for session/new
+	a.workDir = config.WorkDir
 
 	// Start CLI process
 	a.cmd = exec.Command(config.Command, config.Args...)
@@ -122,8 +130,81 @@ func (a *ACPAdapter) IsConnected() bool {
 }
 
 func (a *ACPAdapter) SendMessage(msg Message) error {
+	log.Printf("[ACP.SendMessage] Called: type=%s, connected=%v", msg.Type, a.connected.Load())
+
+	if !a.connected.Load() {
+		return fmt.Errorf("not connected")
+	}
+
 	// Convert unified message to ACP JSON-RPC format
-	// This will be implemented based on message type
+	switch msg.Type {
+	case MessageTypeContent:
+		// Send user message as session/prompt request
+		content, ok := msg.Content.(string)
+		if !ok {
+			return fmt.Errorf("invalid content type")
+		}
+
+		log.Printf("[ACP] Sending prompt to session %s: %s", a.sessionID, content)
+
+		// ACP session/prompt expects prompt as an array of content objects
+		req := map[string]interface{}{
+			"jsonrpc": "2.0",
+			"id":      a.nextRequestID(),
+			"method":  "session/prompt",
+			"params": map[string]interface{}{
+				"sessionId": a.sessionID,
+				"prompt": []interface{}{
+					map[string]interface{}{
+						"type": "text",
+						"text": content,
+					},
+				},
+			},
+		}
+
+		return a.sendJSONRPC(req)
+
+	case MessageTypePermission:
+		// Handle permission response
+		perm, ok := msg.Content.(PermissionResponse)
+		if !ok {
+			return fmt.Errorf("invalid permission response type")
+		}
+
+		// ACP expects the response in this format:
+		// {"jsonrpc": "2.0", "id": <id>, "result": {"outcome": {"optionId": "allow", "outcome": "selected"}}}
+		req := map[string]interface{}{
+			"jsonrpc": "2.0",
+			"id":      perm.ID,
+			"result": map[string]interface{}{
+				"outcome": map[string]interface{}{
+					"optionId": perm.OptionID,
+					"outcome":  "selected",
+				},
+			},
+		}
+
+		log.Printf("[ACP] Sending permission response: id=%s, optionId=%s", perm.ID, perm.OptionID)
+		return a.sendJSONRPC(req)
+
+	case MessageTypeCancel:
+		// Cancel/interrupt current operation
+		log.Printf("[ACP] Sending cancel for session %s", a.sessionID)
+
+		req := map[string]interface{}{
+			"jsonrpc": "2.0",
+			"id":      a.nextRequestID(),
+			"method":  "session/cancel",
+			"params": map[string]interface{}{
+				"sessionId": a.sessionID,
+				"reason":    msg.Content,
+			},
+		}
+
+		return a.sendJSONRPC(req)
+	}
+
 	return nil
 }
 
@@ -152,22 +233,56 @@ func (a *ACPAdapter) SupportsToolCalls() bool {
 	return true
 }
 
-// initialize sends the initialize request
+// initialize sends the initialize request followed by session/new
 func (a *ACPAdapter) initialize() error {
+	// Step 1: Send initialize request
 	req := map[string]interface{}{
 		"jsonrpc": "2.0",
 		"id":      a.nextRequestID(),
 		"method":  "initialize",
 		"params": map[string]interface{}{
-			"protocolVersion": "1.0.0",
-			"clientInfo": map[string]string{
+			"protocolVersion": 1,
+			"clientInfo": map[string]interface{}{
 				"name":    "open-agents-bridge",
+				"title":   "Open Agents Bridge",
 				"version": "1.0.0",
+			},
+			"clientCapabilities": map[string]interface{}{
+				"fs": map[string]interface{}{
+					"readTextFile":  true,
+					"writeTextFile": true,
+				},
+				"terminal": true,
 			},
 		},
 	}
 
-	return a.sendJSONRPC(req)
+	if err := a.sendJSONRPC(req); err != nil {
+		return err
+	}
+
+	// Step 2: Create a new session
+	// Note: session/new should be sent after initialize response
+	// but we send it immediately as the response handling is async
+	time.Sleep(100 * time.Millisecond) // Small delay to ensure initialize is processed
+
+	// Get absolute path for workDir
+	absWorkDir := a.workDir
+	if absWorkDir == "" || absWorkDir == "." {
+		absWorkDir, _ = os.Getwd()
+	}
+
+	sessionReq := map[string]interface{}{
+		"jsonrpc": "2.0",
+		"id":      a.nextRequestID(),
+		"method":  "session/new",
+		"params": map[string]interface{}{
+			"cwd":        absWorkDir,
+			"mcpServers": []interface{}{},
+		},
+	}
+
+	return a.sendJSONRPC(sessionReq)
 }
 
 // readMessages reads JSON-RPC messages from stdout
@@ -181,11 +296,11 @@ func (a *ACPAdapter) readMessages() {
 		}
 
 		line := scanner.Text()
-		logger.Debug("[ACP] Received: %s", line)
+		log.Printf("[ACP] Received: %s", line)
 
 		var msg map[string]interface{}
 		if err := json.Unmarshal([]byte(line), &msg); err != nil {
-			logger.Error("[ACP] Failed to parse JSON: %v", err)
+			log.Printf("[ACP] Failed to parse JSON: %v", err)
 			continue
 		}
 
@@ -193,7 +308,7 @@ func (a *ACPAdapter) readMessages() {
 	}
 
 	if err := scanner.Err(); err != nil {
-		logger.Error("[ACP] Scanner error: %v", err)
+		log.Printf("[ACP] Scanner error: %v", err)
 	}
 }
 
@@ -204,13 +319,14 @@ func (a *ACPAdapter) readErrors() {
 		if !a.connected.Load() {
 			break
 		}
-		logger.Warn("[ACP] stderr: %s", scanner.Text())
+		log.Printf("[ACP stderr] %s", scanner.Text())
 	}
 }
 
 // handleMessage processes incoming JSON-RPC messages
 func (a *ACPAdapter) handleMessage(msg map[string]interface{}) {
 	method, _ := msg["method"].(string)
+	log.Printf("[ACP] Handling message: method=%s", method)
 
 	switch method {
 	case "session/update":
@@ -221,12 +337,19 @@ func (a *ACPAdapter) handleMessage(msg map[string]interface{}) {
 		a.handleFileRead(msg)
 	case "fs/write_text_file":
 		a.handleFileWrite(msg)
+	case "terminal/create":
+		a.handleTerminalCreate(msg)
+	case "terminal/output":
+		// Ignore - we don't need to respond
 	default:
 		// Handle responses
 		if _, ok := msg["result"]; ok {
 			a.handleResponse(msg)
 		} else if _, ok := msg["error"]; ok {
 			a.handleError(msg)
+		} else {
+			// Unknown request - log it
+			log.Printf("[ACP] Unknown method: %s, msg: %v", method, msg)
 		}
 	}
 }
@@ -238,75 +361,107 @@ func (a *ACPAdapter) handleSessionUpdate(msg map[string]interface{}) {
 		return
 	}
 
-	updates, ok := params["updates"].([]interface{})
+	// Handle single update format (used by claude-code-acp)
+	update, ok := params["update"].(map[string]interface{})
 	if !ok {
-		return
+		// Try array format
+		updates, ok := params["updates"].([]interface{})
+		if !ok {
+			return
+		}
+		if len(updates) > 0 {
+			update, ok = updates[0].(map[string]interface{})
+			if !ok {
+				return
+			}
+		}
 	}
 
-	for _, update := range updates {
-		u, ok := update.(map[string]interface{})
+	// Get update type - ACP uses "sessionUpdate" field
+	updateType, _ := update["sessionUpdate"].(string)
+
+	switch updateType {
+	case "agent_message_chunk":
+		// Content is an object with type and text fields
+		contentObj, ok := update["content"].(map[string]interface{})
 		if !ok {
-			continue
+			return
 		}
+		text, _ := contentObj["text"].(string)
+		a.emitMessage(Message{
+			Type:    MessageTypeContent,
+			Content: text,
+			Meta: map[string]interface{}{
+				"protocol": "acp",
+			},
+		})
 
-		updateType, _ := u["type"].(string)
-
-		switch updateType {
-		case "agent_message_chunk":
-			a.emitMessage(Message{
-				Type:    MessageTypeContent,
-				Content: u["content"],
-				Meta: map[string]interface{}{
-					"protocol": "acp",
-				},
-			})
-
-		case "agent_thought_chunk":
-			a.emitMessage(Message{
-				Type:    MessageTypeThought,
-				Content: u["content"],
-				Meta: map[string]interface{}{
-					"protocol": "acp",
-				},
-			})
-
-		case "tool_call":
-			a.emitMessage(Message{
-				Type: MessageTypeToolCall,
-				Content: ToolCall{
-					ID:     u["id"].(string),
-					Name:   u["name"].(string),
-					Input:  u["input"].(map[string]interface{}),
-					Status: "pending",
-				},
-				Meta: map[string]interface{}{
-					"protocol": "acp",
-				},
-			})
-
-		case "tool_call_update":
-			status, _ := u["status"].(string)
-			a.emitMessage(Message{
-				Type: MessageTypeToolCall,
-				Content: ToolCall{
-					ID:     u["id"].(string),
-					Status: status,
-					Result: u["result"],
-				},
-				Meta: map[string]interface{}{
-					"protocol": "acp",
-				},
-			})
-
-		case "end_turn":
-			a.emitMessage(Message{
-				Type:    MessageTypeStatus,
-				Content: StatusIdle,
-				Meta: map[string]interface{}{
-					"protocol": "acp",
-				},
-			})
+	case "agent_thought_chunk":
+		contentObj, ok := update["content"].(map[string]interface{})
+		if !ok {
+			return
 		}
+		text, _ := contentObj["text"].(string)
+		a.emitMessage(Message{
+			Type:    MessageTypeThought,
+			Content: text,
+			Meta: map[string]interface{}{
+				"protocol": "acp",
+			},
+		})
+
+	case "tool_call":
+		// ACP uses toolCallId and title, not id and name
+		toolCallID, _ := update["toolCallId"].(string)
+		if toolCallID == "" {
+			toolCallID, _ = update["id"].(string) // fallback
+		}
+		title, _ := update["title"].(string)
+		if title == "" {
+			title, _ = update["name"].(string) // fallback
+		}
+		status, _ := update["status"].(string)
+		if status == "" {
+			status = "pending"
+		}
+		a.emitMessage(Message{
+			Type: MessageTypeToolCall,
+			Content: ToolCall{
+				ID:     toolCallID,
+				Name:   title,
+				Status: status,
+			},
+			Meta: map[string]interface{}{
+				"protocol": "acp",
+			},
+		})
+
+	case "tool_call_update":
+		toolCallID, _ := update["toolCallId"].(string)
+		if toolCallID == "" {
+			toolCallID, _ = update["id"].(string) // fallback
+		}
+		status, _ := update["status"].(string)
+		a.emitMessage(Message{
+			Type: MessageTypeToolCall,
+			Content: ToolCall{
+				ID:     toolCallID,
+				Status: status,
+				Result: update["result"],
+			},
+			Meta: map[string]interface{}{
+				"protocol": "acp",
+			},
+		})
+
+	case "end_turn":
+		a.emitMessage(Message{
+			Type:    MessageTypeStatus,
+			Content: StatusIdle,
+			Meta: map[string]interface{}{
+				"protocol": "acp",
+			},
+		})
 	}
 }
 
@@ -317,25 +472,57 @@ func (a *ACPAdapter) handlePermissionRequest(msg map[string]interface{}) {
 		return
 	}
 
-	id, _ := msg["id"].(string)
-	toolName, _ := params["tool_name"].(string)
-	toolInput, _ := params["tool_input"].(map[string]interface{})
-	description, _ := params["description"].(string)
-	risk, _ := params["risk"].(string)
-	options, _ := params["options"].([]interface{})
-
-	optionStrs := make([]string, len(options))
-	for i, opt := range options {
-		optionStrs[i], _ = opt.(string)
+	// ACP permission request format
+	// id is at root level for JSON-RPC request
+	// Preserve the original ID type (string or number) for correct JSON-RPC response
+	var id interface{}
+	if idVal, ok := msg["id"]; ok {
+		id = idVal // Keep original type (string, float64, etc.)
 	}
+
+	// Tool call info
+	toolCall, _ := params["toolCall"].(map[string]interface{})
+	toolCallID, _ := toolCall["toolCallId"].(string)
+	title, _ := toolCall["title"].(string)
+	rawInput, _ := toolCall["rawInput"].(map[string]interface{})
+
+	// Options - array of objects with optionId
+	optionsRaw, _ := params["options"].([]interface{})
+	optionStrs := make([]string, 0, len(optionsRaw))
+	for _, opt := range optionsRaw {
+		if optMap, ok := opt.(map[string]interface{}); ok {
+			if optionID, ok := optMap["optionId"].(string); ok {
+				optionStrs = append(optionStrs, optionID)
+			}
+		} else if optStr, ok := opt.(string); ok {
+			// Fallback for string format
+			optionStrs = append(optionStrs, optStr)
+		}
+	}
+
+	// Determine risk based on tool type
+	risk := "medium"
+	if title != "" {
+		// Commands with rm, sudo, etc. are high risk
+		if containsDangerousCommand(title) {
+			risk = "high"
+		}
+	}
+
+	// Use toolCallId as the permission ID if no id provided
+	if id == nil {
+		id = toolCallID
+	}
+
+	log.Printf("[ACP] Permission request: id=%v, toolCallId=%s, title=%s, options=%v", id, toolCallID, title, optionStrs)
 
 	a.emitMessage(Message{
 		Type: MessageTypePermission,
 		Content: PermissionRequest{
 			ID:          id,
-			ToolName:    toolName,
-			ToolInput:   toolInput,
-			Description: description,
+			ToolName:    title,
+			ToolInput:   rawInput,
+			Description: title,
 			Risk:        risk,
 			Options:     optionStrs,
 		},
@@ -345,26 +532,243 @@ func (a *ACPAdapter) handlePermissionRequest(msg map[string]interface{}) {
 	})
 }
 
+func containsDangerousCommand(cmd string) bool {
+	dangerous := []string{"rm ", "sudo ", "chmod ", "chown ", "mkfs", "dd ", "> /dev/", "shutdown", "reboot"}
+	for _, d := range dangerous {
+		if strings.Contains(cmd, d) {
+			return true
+		}
+	}
+	return false
+}
+
 // handleFileRead processes file read requests
 func (a *ACPAdapter) handleFileRead(msg map[string]interface{}) {
-	// TODO: Implement file read
-	logger.Debug("[ACP] File read request: %v", msg)
+	params, ok := msg["params"].(map[string]interface{})
+	if !ok {
+		log.Printf("[ACP] Invalid fs/read_text_file params")
+		return
+	}
+
+	// Get request ID for response
+	var reqID interface{}
+	if idVal, ok := msg["id"]; ok {
+		reqID = idVal
+	}
+
+	path, _ := params["path"].(string)
+	log.Printf("[ACP] File read request: id=%v, path=%s", reqID, path)
+
+	// Read file content
+	content, err := os.ReadFile(path)
+	if err != nil {
+		// Send error response
+		errResp := map[string]interface{}{
+			"jsonrpc": "2.0",
+			"id":      reqID,
+			"error": map[string]interface{}{
+				"code":    -32603,
+				"message": err.Error(),
+			},
+		}
+		a.sendJSONRPC(errResp)
+		return
+	}
+
+	// Send success response
+	response := map[string]interface{}{
+		"jsonrpc": "2.0",
+		"id":      reqID,
+		"result": map[string]interface{}{
+			"content": string(content),
+		},
+	}
+	a.sendJSONRPC(response)
 }
 
 // handleFileWrite processes file write requests
 func (a *ACPAdapter) handleFileWrite(msg map[string]interface{}) {
-	// TODO: Implement file write
-	logger.Debug("[ACP] File write request: %v", msg)
+	params, ok := msg["params"].(map[string]interface{})
+	if !ok {
+		log.Printf("[ACP] Invalid fs/write_text_file params")
+		return
+	}
+
+	// Get request ID for response
+	var reqID interface{}
+	if idVal, ok := msg["id"]; ok {
+		reqID = idVal
+	}
+
+	path, _ := params["path"].(string)
+	content, _ := params["content"].(string)
+	log.Printf("[ACP] File write request: id=%v, path=%s", reqID, path)
+
+	// Create directory if needed
+	dir := filepath.Dir(path)
+	if dir != "" && dir != "." {
+		os.MkdirAll(dir, 0755)
+	}
+
+	// Write file content
+	err := os.WriteFile(path, []byte(content), 0644)
+	if err != nil {
+		// Send error response
+		errResp := map[string]interface{}{
+			"jsonrpc": "2.0",
+			"id":      reqID,
+			"error": map[string]interface{}{
+				"code":    -32603,
+				"message": err.Error(),
+			},
+		}
+		a.sendJSONRPC(errResp)
+		return
+	}
+
+	// Send success response
+	response := map[string]interface{}{
+		"jsonrpc": "2.0",
+		"id":      reqID,
+		"result":  map[string]interface{}{},
+	}
+	a.sendJSONRPC(response)
+}
+
+// handleTerminalCreate processes terminal creation and command execution requests
+func (a *ACPAdapter) handleTerminalCreate(msg map[string]interface{}) {
+	params, ok := msg["params"].(map[string]interface{})
+	if !ok {
+		log.Printf("[ACP] Invalid terminal/create params")
+		return
+	}
+
+	// Get request ID for response
+	var reqID interface{}
+	if idVal, ok := msg["id"]; ok {
+		reqID = idVal
+	}
+
+	// Parse parameters
+	command, _ := params["command"].(string)
+	sessionID, _ := params["sessionId"].(string)
+	outputByteLimit := 32000 // default
+	if limit, ok := params["outputByteLimit"].(float64); ok {
+		outputByteLimit = int(limit)
+	}
+
+	// Parse environment variables
+	env := os.Environ()
+	if envVars, ok := params["env"].([]interface{}); ok {
+		for _, e := range envVars {
+			if envMap, ok := e.(map[string]interface{}); ok {
+				name, _ := envMap["name"].(string)
+				value, _ := envMap["value"].(string)
+				if name != "" {
+					env = append(env, fmt.Sprintf("%s=%s", name, value))
+				}
+			}
+		}
+	}
+
+	// Generate terminal ID
+	terminalID := fmt.Sprintf("term_%d", time.Now().UnixNano())
+
+	log.Printf("[ACP] Terminal create: id=%v, command=%s, sessionId=%s", reqID, command, sessionID)
+
+	// Send response with terminalId
+	response := map[string]interface{}{
+		"jsonrpc": "2.0",
+		"id":      reqID,
+		"result": map[string]interface{}{
+			"terminalId": terminalID,
+		},
+	}
+	a.sendJSONRPC(response)
+
+	// Execute the command
+	go a.executeTerminalCommand(terminalID, command, env, outputByteLimit, sessionID)
+}
+
+// executeTerminalCommand runs a command and sends output notifications
+func (a *ACPAdapter) executeTerminalCommand(terminalID, command string, env []string, outputLimit int, sessionID string) {
+	log.Printf("[ACP] Executing command: %s", command)
+
+	// Execute command
+	cmd := exec.Command("sh", "-c", command)
+	cmd.Env = env
+	cmd.Dir = a.workDir
+
+	output, err := cmd.CombinedOutput()
+	truncated := false
+
+	// Truncate output if needed
+	if len(output) > outputLimit {
+		output = output[:outputLimit]
+		truncated = true
+	}
+
+	// Get exit status
+	var exitStatus map[string]interface{}
+	if err != nil {
+		if exitErr, ok := err.(*exec.ExitError); ok {
+			exitStatus = map[string]interface{}{
+				"exitCode": exitErr.ExitCode(),
+			}
+		} else {
+			exitStatus = map[string]interface{}{
+				"exitCode": 1,
+			}
+		}
+	} else {
+		exitStatus = map[string]interface{}{
+			"exitCode": 0,
+		}
+	}
+
+	// Send terminal/output notification
+	notification := map[string]interface{}{
+		"jsonrpc": "2.0",
+		"method":  "terminal/output",
+		"params": map[string]interface{}{
+			"sessionId":   sessionID,
+			"terminalId":  terminalID,
+			"output":      string(output),
+			"truncated":   truncated,
+			"exitStatus":  exitStatus,
+		},
+	}
+
+	log.Printf("[ACP] Command output: len=%d, exitCode=%v", len(output), exitStatus["exitCode"])
+	a.sendJSONRPC(notification)
 }
 
 // handleResponse processes JSON-RPC responses
 func (a *ACPAdapter) handleResponse(msg map[string]interface{}) {
 	result, _ := msg["result"].(map[string]interface{})
-	
-	// Handle initialize response
+
+	// Handle session/new response (contains sessionId)
 	if sessionID, ok := result["sessionId"].(string); ok {
 		a.sessionID = sessionID
-		logger.Info("[ACP] Session initialized: %s", sessionID)
+		logger.Info("[ACP] Session created: %s", sessionID)
+
+		// Send initialized/ready status to signal successful initialization
+		a.emitMessage(Message{
+			Type:    MessageTypeStatus,
+			Content: StatusIdle,
+			Meta: map[string]interface{}{
+				"protocol": "acp",
+			},
+		})
+		return
+	}
+
+	// Handle initialize response (contains agentInfo and capabilities)
+	if agentInfo, ok := result["agentInfo"].(map[string]interface{}); ok {
+		name, _ := agentInfo["name"].(string)
+		version, _ := agentInfo["version"].(string)
+		logger.Info("[ACP] Connected to agent: %s v%s", name, version)
+		return
 	}
 }
 
@@ -400,9 +804,12 @@ func (a *ACPAdapter) sendJSONRPC(msg interface{}) error {
 		return err
 	}
 
-	logger.Debug("[ACP] Sending: %s", string(data))
+	log.Printf("[ACP] sendJSONRPC: %s", string(data))
 
 	_, err = a.stdin.Write(append(data, '\n'))
+	if err != nil {
+		log.Printf("[ACP] sendJSONRPC error: %v", err)
+	}
 	return err
 }
 

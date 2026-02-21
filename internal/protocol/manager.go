@@ -2,6 +2,7 @@ package protocol
 
 import (
 	"fmt"
+	"log"
 	"time"
 
 	"github.com/open-agents/bridge/internal/logger"
@@ -36,11 +37,6 @@ func (m *Manager) Connect(config AdapterConfig) error {
 // tryACP attempts to connect using ACP protocol
 func (m *Manager) tryACP(config AdapterConfig) error {
 	adapter := NewACPAdapter()
-	adapter.Subscribe(m.callback)
-
-	if err := adapter.Connect(config); err != nil {
-		return err
-	}
 
 	// Wait for initialization (3 seconds timeout)
 	timeout := time.After(3 * time.Second)
@@ -48,23 +44,37 @@ func (m *Manager) tryACP(config AdapterConfig) error {
 
 	// Subscribe to messages to detect initialization
 	originalCallback := m.callback
-	m.callback = func(msg Message) {
+	initCallback := func(msg Message) {
 		if msg.Type == MessageTypeStatus {
-			initialized <- true
+			select {
+			case initialized <- true:
+			default:
+			}
 		}
 		if originalCallback != nil {
 			originalCallback(msg)
 		}
 	}
 
+	// Set callback before connecting
+	adapter.Subscribe(initCallback)
+
+	if err := adapter.Connect(config); err != nil {
+		return err
+	}
+
 	select {
 	case <-initialized:
 		m.adapter = adapter
-		m.callback = originalCallback
+		// Restore original callback after initialization
+		if originalCallback != nil {
+			adapter.Subscribe(originalCallback)
+			m.callback = originalCallback
+		}
+		logger.Info("[Protocol] ACP initialized successfully")
 		return nil
 	case <-timeout:
 		adapter.Disconnect()
-		m.callback = originalCallback
 		return fmt.Errorf("ACP initialization timeout")
 	}
 }
@@ -100,6 +110,7 @@ func (m *Manager) IsConnected() bool {
 
 // SendMessage sends a message through the current adapter
 func (m *Manager) SendMessage(msg Message) error {
+	log.Printf("[Manager.SendMessage] Called: adapter nil: %v, msg type: %s", m.adapter == nil, msg.Type)
 	if m.adapter == nil {
 		return fmt.Errorf("no adapter connected")
 	}

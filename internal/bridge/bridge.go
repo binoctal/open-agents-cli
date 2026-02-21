@@ -353,6 +353,8 @@ func (b *Bridge) handleMessage(msg Message) {
 		b.handleSessionSend(msg)
 	case "session:stop":
 		b.handleSessionStop(msg)
+	case "session:cancel":
+		b.handleSessionCancel(msg)
 	case "session:resize":
 		b.handleSessionResize(msg)
 	case "chat:send":
@@ -477,6 +479,41 @@ func (b *Bridge) handleSessionStop(msg Message) {
 	})
 }
 
+func (b *Bridge) handleSessionCancel(msg Message) {
+	payload, ok := msg.Payload.(map[string]interface{})
+	if !ok {
+		return
+	}
+
+	sessionID, _ := payload["sessionId"].(string)
+	log.Printf("[Bridge] Cancelling session: %s", sessionID)
+
+	// Send cancel to the session (ACP protocol)
+	sess := b.sessions.Get(sessionID)
+	if sess == nil {
+		log.Printf("Session not found: %s", sessionID)
+		return
+	}
+
+	// Send session/cancel via protocol
+	if sess.Protocol != nil {
+		sess.Protocol.SendMessage(protocol.Message{
+			Type:    protocol.MessageTypeCancel,
+			Content: "user_cancelled",
+		})
+	}
+
+	// Send cancelled notification
+	b.sendMessage(Message{
+		Type: "session:cancelled",
+		Payload: map[string]interface{}{
+			"sessionId": sessionID,
+			"deviceId":  b.config.DeviceID,
+		},
+		Timestamp: time.Now().UnixMilli(),
+	})
+}
+
 func (b *Bridge) handleSessionResize(msg Message) {
 	payload, ok := msg.Payload.(map[string]interface{})
 	if !ok {
@@ -507,13 +544,48 @@ func (b *Bridge) handlePermissionResponse(msg Message) {
 		return
 	}
 
-	id, _ := payload["id"].(string)
+	// ID can be string or number in JSON-RPC 2.0
+	var id interface{}
+	if idVal, ok := payload["id"]; ok {
+		id = idVal
+	}
 	approved, _ := payload["approved"].(bool)
+	optionID, _ := payload["optionId"].(string)
 
+	log.Printf("[Bridge] Permission response: id=%v, approved=%v, optionId=%s", id, approved, optionID)
+
+	// Convert ID to string for internal permission handler
+	var idStr string
+	switch v := id.(type) {
+	case string:
+		idStr = v
+	case float64:
+		idStr = fmt.Sprintf("%d", int(v))
+	}
+
+	// First resolve internal permission handler
 	b.permHandler.Resolve(permission.Response{
-		ID:       id,
+		ID:       idStr,
 		Approved: approved,
 	})
+
+	// Also send to ACP protocol if optionId is provided
+	if optionID != "" {
+		// Find session by permission ID (stored in permission handler)
+		// For now, send to all active sessions
+		for _, sess := range b.sessions.List() {
+			if sess.Protocol != nil && sess.Protocol.GetProtocolName() == "acp" {
+				log.Printf("[Bridge] Sending permission response to ACP session: %s", sess.ID)
+				sess.Protocol.SendMessage(protocol.Message{
+					Type: protocol.MessageTypePermission,
+					Content: protocol.PermissionResponse{
+						ID:       id,
+						OptionID: optionID,
+					},
+				})
+			}
+		}
+	}
 }
 
 func (b *Bridge) handleControlTakeover(msg Message) {

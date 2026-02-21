@@ -11,6 +11,7 @@ const (
 	MessageTypeStatus     MessageType = "status"      // Agent status change
 	MessageTypePlan       MessageType = "plan"        // Task plan
 	MessageTypeError      MessageType = "error"       // Error message
+	MessageTypeCancel     MessageType = "cancel"      // Cancel/interrupt operation
 )
 
 // AgentStatus represents the current state of the agent
@@ -33,7 +34,7 @@ type Message struct {
 
 // PermissionRequest represents a permission request
 type PermissionRequest struct {
-	ID          string                 `json:"id"`
+	ID          interface{}            `json:"id"`          // Can be string or number (JSON-RPC 2.0)
 	ToolName    string                 `json:"tool_name"`
 	ToolInput   map[string]interface{} `json:"tool_input"`
 	Description string                 `json:"description"`
@@ -43,8 +44,8 @@ type PermissionRequest struct {
 
 // PermissionResponse represents the user's response
 type PermissionResponse struct {
-	ID       string `json:"id"`
-	OptionID string `json:"option_id"` // "allow_once", "allow_always", "reject_once", "reject_always"
+	ID       interface{} `json:"id"`       // Can be string or number (JSON-RPC 2.0 requires same type as request)
+	OptionID string      `json:"option_id"` // "allow_once", "allow_always", "reject_once", "reject_always"
 }
 
 // ToolCall represents a tool invocation

@@ -168,13 +168,19 @@ func (m *Manager) StopAll() {
 }
 
 func (s *Session) Send(input string) error {
+	log.Printf("[Session.Send] Called for session %s, input: %q, Protocol nil: %v", s.ID, input, s.Protocol == nil)
 	if s.Protocol == nil {
+		log.Printf("[Session.Send] ERROR: Protocol is nil for session %s", s.ID)
 		return nil
 	}
-	return s.Protocol.SendMessage(protocol.Message{
+	err := s.Protocol.SendMessage(protocol.Message{
 		Type:    protocol.MessageTypeContent,
 		Content: input,
 	})
+	if err != nil {
+		log.Printf("[Session.Send] SendMessage error: %v", err)
+	}
+	return err
 }
 
 func (s *Session) Resize(cols, rows int) error {
