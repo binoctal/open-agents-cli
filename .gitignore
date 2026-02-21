@@ -1,6 +1,7 @@
 # Go 编译产物
 open-agents
 dev-server
+build/
 
 # Go 通用二进制
 *.exe
