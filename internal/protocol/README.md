@@ -73,13 +73,17 @@ Manager 会自动尝试以下顺序：
 
 #### ACP 协议
 
-- Claude Code: `claude --experimental-acp`
+- ~~Claude Code~~: 不支持（使用 PTY）
 - Qwen Code: `qwen-code --experimental-acp`
 - Goose: `goose acp`
 - Gemini CLI: `gemini-cli --acp`
 
 #### PTY 协议（兜底）
 
+- Claude CLI
+- Kiro CLI
+- Cline
+- Codex
 - 所有其他 CLI 工具
 
 ## 开发
