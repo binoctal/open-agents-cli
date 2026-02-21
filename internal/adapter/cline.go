@@ -143,3 +143,13 @@ func (a *ClineAdapter) OnPermission(callback func(PermissionRequest) PermissionR
 func (a *ClineAdapter) OnExit(callback func(int)) {
 	a.exitCallback = callback
 }
+
+func (a *ClineAdapter) Resize(cols, rows int) error {
+	// TODO: Implement PTY resize for Cline
+	return nil
+}
+
+func (a *ClineAdapter) StartWithSize(workDir string, args []string, cols, rows int) error {
+	// Cline uses stdin/stdout, not PTY, so size is ignored
+	return a.Start(workDir, args)
+}

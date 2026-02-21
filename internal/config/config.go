@@ -25,8 +25,11 @@ type Config struct {
 	Rules []AutoApprovalRule `json:"rules,omitempty"`
 
 	// v1.2: Storage settings
-	StorageType string       `json:"storageType,omitempty"` // saas, s3, local
-	S3Config    *S3Config    `json:"s3Config,omitempty"`
+	StorageType string    `json:"storageType,omitempty"` // saas, s3, local
+	S3Config    *S3Config `json:"s3Config,omitempty"`
+
+	// v1.3: Logging settings
+	LogLevel string `json:"logLevel,omitempty"` // debug, info, warn, error (default: info)
 }
 
 type AutoApprovalRule struct {

@@ -31,8 +31,10 @@ type Adapter interface {
 	IsInstalled() bool
 
 	Start(workDir string, args []string) error
+	StartWithSize(workDir string, args []string, cols, rows int) error
 	Stop() error
 	IsRunning() bool
+	Resize(cols, rows int) error
 
 	Send(input string) error
 	OnOutput(callback func(OutputEvent))

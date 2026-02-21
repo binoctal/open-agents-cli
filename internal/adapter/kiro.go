@@ -144,3 +144,13 @@ func (a *KiroAdapter) OnPermission(callback func(PermissionRequest) PermissionRe
 func (a *KiroAdapter) OnExit(callback func(int)) {
 	a.exitCallback = callback
 }
+
+func (a *KiroAdapter) Resize(cols, rows int) error {
+	// TODO: Implement PTY resize for Kiro
+	return nil
+}
+
+func (a *KiroAdapter) StartWithSize(workDir string, args []string, cols, rows int) error {
+	// Kiro uses stdin/stdout, not PTY, so size is ignored
+	return a.Start(workDir, args)
+}

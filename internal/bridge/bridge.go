@@ -16,6 +16,7 @@ import (
 	"github.com/open-agents/bridge/internal/config"
 	"github.com/open-agents/bridge/internal/crypto"
 	"github.com/open-agents/bridge/internal/permission"
+	"github.com/open-agents/bridge/internal/protocol"
 	"github.com/open-agents/bridge/internal/rules"
 	"github.com/open-agents/bridge/internal/session"
 	"github.com/open-agents/bridge/internal/storage"
@@ -126,34 +127,130 @@ func (b *Bridge) Start() error {
 	})
 
 	// Set up session output forwarding
-	b.sessions.SetOutputCallback(func(sessionID, outputType, content string) {
-		b.sendMessage(Message{
-			Type: "session:output",
-			Payload: map[string]interface{}{
-				"sessionId":  sessionID,
-				"deviceId":   b.config.DeviceID,
-				"outputType": outputType,
-				"content":    content,
-			},
-			Timestamp: time.Now().UnixMilli(),
-		})
-	})
+	b.sessions.SetOutputCallback(func(sessionID string, msg protocol.Message) {
+		log.Printf("[Bridge] Forwarding protocol message: sessionId=%s, type=%s", sessionID, msg.Type)
+		
+		// Get session to check protocol
+		sess := b.sessions.Get(sessionID)
+		protocolName := "unknown"
+		if sess != nil {
+			protocolName = sess.GetProtocolName()
+		}
 
-	// Set up chat response forwarding
-	b.sessions.SetChatCallback(func(sessionID, content string, codeBlock *session.CodeBlock) {
-		payload := map[string]interface{}{
-			"sessionId": sessionID,
-			"deviceId":  b.config.DeviceID,
-			"content":   content,
+		switch msg.Type {
+		case protocol.MessageTypeContent:
+			// AI response content
+			b.sendMessage(Message{
+				Type: "chat:response",
+				Payload: map[string]interface{}{
+					"sessionId": sessionID,
+					"deviceId":  b.config.DeviceID,
+					"content":   msg.Content,
+					"protocol":  protocolName,
+				},
+				Timestamp: time.Now().UnixMilli(),
+			})
+
+		case protocol.MessageTypeThought:
+			// AI thinking process
+			b.sendMessage(Message{
+				Type: "chat:thought",
+				Payload: map[string]interface{}{
+					"sessionId": sessionID,
+					"deviceId":  b.config.DeviceID,
+					"content":   msg.Content,
+					"protocol":  protocolName,
+				},
+				Timestamp: time.Now().UnixMilli(),
+			})
+
+		case protocol.MessageTypeToolCall:
+			// Tool invocation
+			b.sendMessage(Message{
+				Type: "tool:call",
+				Payload: map[string]interface{}{
+					"sessionId": sessionID,
+					"deviceId":  b.config.DeviceID,
+					"toolCall":  msg.Content,
+					"protocol":  protocolName,
+				},
+				Timestamp: time.Now().UnixMilli(),
+			})
+
+		case protocol.MessageTypePermission:
+			// Permission request
+			permReq := msg.Content.(protocol.PermissionRequest)
+			b.sendMessage(Message{
+				Type: "permission:request",
+				Payload: map[string]interface{}{
+					"sessionId":   sessionID,
+					"deviceId":    b.config.DeviceID,
+					"id":          permReq.ID,
+					"toolName":    permReq.ToolName,
+					"toolInput":   permReq.ToolInput,
+					"description": permReq.Description,
+					"risk":        permReq.Risk,
+					"options":     permReq.Options,
+					"protocol":    protocolName,
+				},
+				Timestamp: time.Now().UnixMilli(),
+			})
+
+		case protocol.MessageTypeStatus:
+			// Agent status change
+			b.sendMessage(Message{
+				Type: "agent:status",
+				Payload: map[string]interface{}{
+					"sessionId": sessionID,
+					"deviceId":  b.config.DeviceID,
+					"status":    msg.Content,
+					"protocol":  protocolName,
+				},
+				Timestamp: time.Now().UnixMilli(),
+			})
+
+		case protocol.MessageTypePlan:
+			// Task plan
+			b.sendMessage(Message{
+				Type: "agent:plan",
+				Payload: map[string]interface{}{
+					"sessionId": sessionID,
+					"deviceId":  b.config.DeviceID,
+					"plan":      msg.Content,
+					"protocol":  protocolName,
+				},
+				Timestamp: time.Now().UnixMilli(),
+			})
+
+		case protocol.MessageTypeError:
+			// Error message
+			b.sendMessage(Message{
+				Type: "session:error",
+				Payload: map[string]interface{}{
+					"sessionId": sessionID,
+					"deviceId":  b.config.DeviceID,
+					"error":     msg.Content,
+					"protocol":  protocolName,
+				},
+				Timestamp: time.Now().UnixMilli(),
+			})
+
+		default:
+			// For PTY raw output, send as session:output
+			if protocolName == "pty" {
+				b.sendMessage(Message{
+					Type: "session:output",
+					Payload: map[string]interface{}{
+						"sessionId":  sessionID,
+						"deviceId":   b.config.DeviceID,
+						"outputType": "stdout",
+						"content":    msg.Content,
+						"protocol":   protocolName,
+					},
+					Timestamp: time.Now().UnixMilli(),
+				})
+			}
 		}
-		if codeBlock != nil {
-			payload["codeBlock"] = codeBlock
-		}
-		b.sendMessage(Message{
-			Type:      "chat:response",
-			Payload:   payload,
-			Timestamp: time.Now().UnixMilli(),
-		})
 	})
 
 	if err := b.connect(); err != nil {
@@ -248,6 +345,7 @@ func (b *Bridge) readLoop() {
 }
 
 func (b *Bridge) handleMessage(msg Message) {
+	log.Printf("[Bridge] Received message type: %s, payload: %+v", msg.Type, msg.Payload)
 	switch msg.Type {
 	case "session:start":
 		b.handleSessionStart(msg)
@@ -255,6 +353,8 @@ func (b *Bridge) handleMessage(msg Message) {
 		b.handleSessionSend(msg)
 	case "session:stop":
 		b.handleSessionStop(msg)
+	case "session:resize":
+		b.handleSessionResize(msg)
 	case "chat:send":
 		b.handleChatSend(msg)
 	case "permission:response":
@@ -273,14 +373,29 @@ func (b *Bridge) handleMessage(msg Message) {
 }
 
 func (b *Bridge) handleSessionStart(msg Message) {
+	log.Printf("[Bridge] handleSessionStart called")
 	payload, ok := msg.Payload.(map[string]interface{})
 	if !ok {
+		log.Printf("[Bridge] handleSessionStart: invalid payload type")
 		return
 	}
 
+	sessionID, _ := payload["sessionId"].(string)
 	cliType, _ := payload["cliType"].(string)
 	workDir, _ := payload["workDir"].(string)
 	initialCommand, _ := payload["command"].(string)
+
+	// Get terminal size from payload
+	cols := 120 // default
+	rows := 30  // default
+	if c, ok := payload["cols"].(float64); ok && c > 0 {
+		cols = int(c)
+	}
+	if r, ok := payload["rows"].(float64); ok && r > 0 {
+		rows = int(r)
+	}
+
+	log.Printf("[Bridge] sessionID=%s, cliType=%s, workDir=%s, cols=%d, rows=%d", sessionID, cliType, workDir, cols, rows)
 
 	if cliType == "" {
 		cliType = "kiro" // default
@@ -289,7 +404,7 @@ func (b *Bridge) handleSessionStart(msg Message) {
 		workDir = "."
 	}
 
-	sess, err := b.sessions.Create(cliType, workDir)
+	sess, err := b.sessions.CreateWithIDAndSize(cliType, workDir, sessionID, cols, rows)
 	if err != nil {
 		log.Printf("Failed to create session: %v", err)
 		b.sendMessage(Message{
@@ -360,6 +475,29 @@ func (b *Bridge) handleSessionStop(msg Message) {
 		},
 		Timestamp: time.Now().UnixMilli(),
 	})
+}
+
+func (b *Bridge) handleSessionResize(msg Message) {
+	payload, ok := msg.Payload.(map[string]interface{})
+	if !ok {
+		return
+	}
+
+	sessionID, _ := payload["sessionId"].(string)
+	cols := 80
+	rows := 24
+
+	if c, ok := payload["cols"].(float64); ok {
+		cols = int(c)
+	}
+	if r, ok := payload["rows"].(float64); ok {
+		rows = int(r)
+	}
+
+	log.Printf("[Bridge] Resizing session %s to %dx%d", sessionID, cols, rows)
+	if err := b.sessions.Resize(sessionID, cols, rows); err != nil {
+		log.Printf("Failed to resize session: %v", err)
+	}
 }
 
 func (b *Bridge) handlePermissionResponse(msg Message) {

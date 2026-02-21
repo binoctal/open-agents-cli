@@ -153,3 +153,13 @@ func (a *GeminiAdapter) OnPermission(callback func(PermissionRequest) Permission
 func (a *GeminiAdapter) OnExit(callback func(int)) {
 	a.exitCallback = callback
 }
+
+func (a *GeminiAdapter) Resize(cols, rows int) error {
+	// TODO: Implement PTY resize for Gemini
+	return nil
+}
+
+func (a *GeminiAdapter) StartWithSize(workDir string, args []string, cols, rows int) error {
+	// Gemini uses stdin/stdout, not PTY, so size is ignored
+	return a.Start(workDir, args)
+}

@@ -3,6 +3,7 @@ module github.com/open-agents/bridge
 go 1.21
 
 require (
+	github.com/creack/pty v1.1.24
 	github.com/google/uuid v1.6.0
 	github.com/gorilla/websocket v1.5.1
 	github.com/spf13/cobra v1.8.0

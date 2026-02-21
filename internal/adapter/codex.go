@@ -153,3 +153,13 @@ func (a *CodexAdapter) OnPermission(callback func(PermissionRequest) PermissionR
 func (a *CodexAdapter) OnExit(callback func(int)) {
 	a.exitCallback = callback
 }
+
+func (a *CodexAdapter) Resize(cols, rows int) error {
+	// TODO: Implement PTY resize for Codex
+	return nil
+}
+
+func (a *CodexAdapter) StartWithSize(workDir string, args []string, cols, rows int) error {
+	// Codex uses stdin/stdout, not PTY, so size is ignored
+	return a.Start(workDir, args)
+}

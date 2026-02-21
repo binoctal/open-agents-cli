@@ -1,40 +1,29 @@
 package session
 
 import (
-	"strings"
+	"log"
 	"sync"
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/open-agents/bridge/internal/adapter"
+	"github.com/open-agents/bridge/internal/protocol"
 )
 
-type OutputCallback func(sessionID, outputType, content string)
-type ChatCallback func(sessionID, content string, codeBlock *CodeBlock)
-
-type CodeBlock struct {
-	Language string `json:"language"`
-	Code     string `json:"code"`
-}
+type OutputCallback func(sessionID string, msg protocol.Message)
 
 type Manager struct {
 	sessions       map[string]*Session
 	mu             sync.RWMutex
 	outputCallback OutputCallback
-	chatCallback   ChatCallback
 }
 
 type Session struct {
-	ID           string
-	CLIType      string
-	WorkDir      string
-	Status       string // "active", "completed", "error"
-	Adapter      adapter.Adapter
-	CreatedAt    time.Time
-	outputBuffer strings.Builder
-	inCodeBlock  bool
-	codeLanguage string
-	codeBuffer   strings.Builder
+	ID        string
+	CLIType   string
+	WorkDir   string
+	Status    string // "active", "completed", "error"
+	Protocol  *protocol.Manager
+	CreatedAt time.Time
 }
 
 func NewManager() *Manager {
@@ -47,108 +36,86 @@ func (m *Manager) SetOutputCallback(callback OutputCallback) {
 	m.outputCallback = callback
 }
 
-func (m *Manager) SetChatCallback(callback ChatCallback) {
-	m.chatCallback = callback
+func (m *Manager) Create(cliType, workDir string) (*Session, error) {
+	return m.CreateWithID(cliType, workDir, "")
 }
 
-func (m *Manager) Create(cliType, workDir string) (*Session, error) {
+func (m *Manager) CreateWithID(cliType, workDir, sessionID string) (*Session, error) {
+	return m.CreateWithIDAndSize(cliType, workDir, sessionID, 120, 30)
+}
+
+func (m *Manager) CreateWithIDAndSize(cliType, workDir, sessionID string, cols, rows int) (*Session, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	adp, err := adapter.Get(cliType)
-	if err != nil {
-		return nil, err
+	// Use provided sessionID or generate a new one
+	if sessionID == "" {
+		sessionID = uuid.New().String()
 	}
 
+	// Create protocol manager
+	protocolMgr := protocol.NewManager()
+
 	sess := &Session{
-		ID:        uuid.New().String(),
+		ID:        sessionID,
 		CLIType:   cliType,
 		WorkDir:   workDir,
 		Status:    "active",
-		Adapter:   adp,
+		Protocol:  protocolMgr,
 		CreatedAt: time.Now(),
 	}
 
-	// Set up output callback - parse for chat responses
-	if m.outputCallback != nil || m.chatCallback != nil {
-		adp.OnOutput(func(event adapter.OutputEvent) {
-			// Forward raw output
-			if m.outputCallback != nil {
-				m.outputCallback(sess.ID, event.Type, event.Content)
-			}
-
-			// Parse for chat responses
-			if m.chatCallback != nil && event.Type == "stdout" {
-				m.parseOutput(sess, event.Content)
-			}
+	// Set up message callback
+	if m.outputCallback != nil {
+		log.Printf("[SessionManager] Setting up message callback for session %s", sessionID)
+		protocolMgr.Subscribe(func(msg protocol.Message) {
+			log.Printf("[SessionManager] Message received: type=%s", msg.Type)
+			m.outputCallback(sess.ID, msg)
 		})
+	} else {
+		log.Printf("[SessionManager] WARNING: No output callback set for session %s", sessionID)
 	}
 
-	// Set up exit callback
-	adp.OnExit(func(code int) {
-		m.mu.Lock()
-		sess.Status = "completed"
-		m.mu.Unlock()
+	// Get CLI command and args
+	command, args := m.getCLICommand(cliType)
 
-		// Flush any remaining output
-		if m.chatCallback != nil && sess.outputBuffer.Len() > 0 {
-			m.chatCallback(sess.ID, sess.outputBuffer.String(), nil)
-		}
-	})
+	// Connect with auto-detection
+	config := protocol.AdapterConfig{
+		WorkDir: workDir,
+		Command: command,
+		Args:    args,
+		Cols:    cols,
+		Rows:    rows,
+	}
 
-	if err := adp.Start(workDir, nil); err != nil {
+	if err := protocolMgr.Connect(config); err != nil {
 		return nil, err
 	}
+
+	log.Printf("[SessionManager] Session %s connected using protocol: %s", sessionID, protocolMgr.GetProtocolName())
 
 	m.sessions[sess.ID] = sess
 	return sess, nil
 }
 
-// parseOutput parses CLI output for chat messages and code blocks
-func (m *Manager) parseOutput(sess *Session, line string) {
-	trimmed := strings.TrimSpace(line)
-
-	// Detect code block start
-	if strings.HasPrefix(trimmed, "```") {
-		if !sess.inCodeBlock {
-			// Start of code block
-			sess.inCodeBlock = true
-			sess.codeLanguage = strings.TrimPrefix(trimmed, "```")
-			sess.codeBuffer.Reset()
-
-			// Flush text before code block
-			if sess.outputBuffer.Len() > 0 {
-				m.chatCallback(sess.ID, sess.outputBuffer.String(), nil)
-				sess.outputBuffer.Reset()
-			}
-		} else {
-			// End of code block
-			sess.inCodeBlock = false
-			m.chatCallback(sess.ID, "", &CodeBlock{
-				Language: sess.codeLanguage,
-				Code:     sess.codeBuffer.String(),
-			})
-		}
-		return
-	}
-
-	if sess.inCodeBlock {
-		if sess.codeBuffer.Len() > 0 {
-			sess.codeBuffer.WriteString("\n")
-		}
-		sess.codeBuffer.WriteString(line)
-	} else {
-		// Accumulate text output
-		if sess.outputBuffer.Len() > 0 {
-			sess.outputBuffer.WriteString("\n")
-		}
-		sess.outputBuffer.WriteString(line)
-
-		// Flush on empty line or after accumulating enough
-		if trimmed == "" || sess.outputBuffer.Len() > 500 {
-			m.chatCallback(sess.ID, sess.outputBuffer.String(), nil)
-			sess.outputBuffer.Reset()
-		}
+func (m *Manager) getCLICommand(cliType string) (string, []string) {
+	switch cliType {
+	case "claude":
+		return "claude", []string{"--experimental-acp"}
+	case "qwen":
+		return "qwen-code", []string{"--experimental-acp"}
+	case "goose":
+		return "goose", []string{"acp"}
+	case "gemini":
+		return "gemini-cli", []string{"--acp"}
+	case "kiro":
+		return "kiro", []string{"chat"}
+	case "cline":
+		return "cline", nil
+	case "codex":
+		return "codex", nil
+	default:
+		return cliType, nil
 	}
 }
 
@@ -178,8 +145,8 @@ func (m *Manager) Stop(id string) error {
 		return nil
 	}
 
-	if sess.Adapter != nil {
-		sess.Adapter.Stop()
+	if sess.Protocol != nil {
+		sess.Protocol.Disconnect()
 	}
 
 	sess.Status = "completed"
@@ -192,16 +159,44 @@ func (m *Manager) StopAll() {
 	defer m.mu.Unlock()
 
 	for _, sess := range m.sessions {
-		if sess.Adapter != nil {
-			sess.Adapter.Stop()
+		if sess.Protocol != nil {
+			sess.Protocol.Disconnect()
 		}
 	}
 	m.sessions = make(map[string]*Session)
 }
 
 func (s *Session) Send(input string) error {
-	if s.Adapter == nil {
+	if s.Protocol == nil {
 		return nil
 	}
-	return s.Adapter.Send(input)
+	return s.Protocol.SendMessage(protocol.Message{
+		Type:    protocol.MessageTypeContent,
+		Content: input,
+	})
+}
+
+func (s *Session) Resize(cols, rows int) error {
+	// Resize is handled by the protocol adapter
+	// For now, we don't expose this in the protocol interface
+	// TODO: Add resize support to protocol.Adapter interface if needed
+	return nil
+}
+
+func (m *Manager) Resize(id string, cols, rows int) error {
+	m.mu.RLock()
+	sess, ok := m.sessions[id]
+	m.mu.RUnlock()
+
+	if !ok {
+		return nil
+	}
+	return sess.Resize(cols, rows)
+}
+
+func (s *Session) GetProtocolName() string {
+	if s.Protocol == nil {
+		return "none"
+	}
+	return s.Protocol.GetProtocolName()
 }
