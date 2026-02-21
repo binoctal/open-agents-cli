@@ -358,6 +358,9 @@ func (a *ACPAdapter) handleMessage(msg map[string]interface{}) {
 	case "terminal/output":
 		// This is a request from agent to get output - respond with stored output
 		a.handleTerminalOutputRequest(msg)
+	case "terminal/release":
+		// Release terminal resources
+		a.handleTerminalRelease(msg)
 	default:
 		// Handle responses
 		if _, ok := msg["result"]; ok {
@@ -871,6 +874,37 @@ func (a *ACPAdapter) handleTerminalOutputRequest(msg map[string]interface{}) {
 				"exitCode": state.exitCode,
 			},
 		},
+	}
+	a.sendJSONRPC(response)
+}
+
+// handleTerminalRelease handles terminal/release requests - releases terminal resources
+func (a *ACPAdapter) handleTerminalRelease(msg map[string]interface{}) {
+	params, ok := msg["params"].(map[string]interface{})
+	if !ok {
+		log.Printf("[ACP] Invalid terminal/release params")
+		return
+	}
+
+	var reqID interface{}
+	if idVal, ok := msg["id"]; ok {
+		reqID = idVal
+	}
+
+	terminalID, _ := params["terminalId"].(string)
+
+	log.Printf("[ACP] Terminal release: id=%v, terminalId=%s", reqID, terminalID)
+
+	// Remove terminal from map
+	a.terminalMu.Lock()
+	delete(a.terminals, terminalID)
+	a.terminalMu.Unlock()
+
+	// Send success response
+	response := map[string]interface{}{
+		"jsonrpc": "2.0",
+		"id":      reqID,
+		"result":  map[string]interface{}{},
 	}
 	a.sendJSONRPC(response)
 }
