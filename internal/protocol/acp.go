@@ -17,23 +17,37 @@ import (
 	"github.com/open-agents/bridge/internal/logger"
 )
 
+// terminalState stores the state of a terminal command
+type terminalState struct {
+	output     string
+	exitCode   int
+	signal     string
+	truncated  bool
+	done       bool
+	doneChan   chan struct{}
+}
+
 // ACPAdapter implements the Agent Client Protocol (ACP)
 type ACPAdapter struct {
-	cmd       *exec.Cmd
-	stdin     io.WriteCloser
-	stdout    io.ReadCloser
-	stderr    io.ReadCloser
-	connected atomic.Bool
-	callback  func(Message)
-	requestID atomic.Int64
-	mu        sync.Mutex
-	sessionID string
-	workDir   string
+	cmd         *exec.Cmd
+	stdin       io.WriteCloser
+	stdout      io.ReadCloser
+	stderr      io.ReadCloser
+	connected   atomic.Bool
+	callback    func(Message)
+	requestID   atomic.Int64
+	mu          sync.Mutex
+	sessionID   string
+	workDir     string
+	terminals   map[string]*terminalState // terminalId -> state
+	terminalMu  sync.RWMutex
 }
 
 // NewACPAdapter creates a new ACP adapter
 func NewACPAdapter() *ACPAdapter {
-	return &ACPAdapter{}
+	return &ACPAdapter{
+		terminals: make(map[string]*terminalState),
+	}
 }
 
 func (a *ACPAdapter) Name() string {
@@ -339,8 +353,11 @@ func (a *ACPAdapter) handleMessage(msg map[string]interface{}) {
 		a.handleFileWrite(msg)
 	case "terminal/create":
 		a.handleTerminalCreate(msg)
+	case "terminal/wait_for_exit":
+		a.handleTerminalWaitForExit(msg)
 	case "terminal/output":
-		// Ignore - we don't need to respond
+		// This is a request from agent to get output - respond with stored output
+		a.handleTerminalOutputRequest(msg)
 	default:
 		// Handle responses
 		if _, ok := msg["result"]; ok {
@@ -676,7 +693,15 @@ func (a *ACPAdapter) handleTerminalCreate(msg map[string]interface{}) {
 
 	log.Printf("[ACP] Terminal create: id=%v, command=%s, sessionId=%s", reqID, command, sessionID)
 
-	// Send response with terminalId
+	// Create terminal state
+	state := &terminalState{
+		doneChan: make(chan struct{}),
+	}
+	a.terminalMu.Lock()
+	a.terminals[terminalID] = state
+	a.terminalMu.Unlock()
+
+	// Send response with terminalId immediately
 	response := map[string]interface{}{
 		"jsonrpc": "2.0",
 		"id":      reqID,
@@ -686,12 +711,12 @@ func (a *ACPAdapter) handleTerminalCreate(msg map[string]interface{}) {
 	}
 	a.sendJSONRPC(response)
 
-	// Execute the command
-	go a.executeTerminalCommand(terminalID, command, env, outputByteLimit, sessionID)
+	// Execute the command in background
+	go a.executeTerminalCommand(terminalID, command, env, outputByteLimit)
 }
 
-// executeTerminalCommand runs a command and sends output notifications
-func (a *ACPAdapter) executeTerminalCommand(terminalID, command string, env []string, outputLimit int, sessionID string) {
+// executeTerminalCommand runs a command and stores the result
+func (a *ACPAdapter) executeTerminalCommand(terminalID, command string, env []string, outputLimit int) {
 	log.Printf("[ACP] Executing command: %s", command)
 
 	// Execute command
@@ -700,47 +725,154 @@ func (a *ACPAdapter) executeTerminalCommand(terminalID, command string, env []st
 	cmd.Dir = a.workDir
 
 	output, err := cmd.CombinedOutput()
-	truncated := false
 
 	// Truncate output if needed
+	truncated := false
 	if len(output) > outputLimit {
 		output = output[:outputLimit]
 		truncated = true
 	}
 
 	// Get exit status
-	var exitStatus map[string]interface{}
+	var exitCode int
+	var signal string
 	if err != nil {
 		if exitErr, ok := err.(*exec.ExitError); ok {
-			exitStatus = map[string]interface{}{
-				"exitCode": exitErr.ExitCode(),
-			}
+			exitCode = exitErr.ExitCode()
 		} else {
-			exitStatus = map[string]interface{}{
-				"exitCode": 1,
-			}
-		}
-	} else {
-		exitStatus = map[string]interface{}{
-			"exitCode": 0,
+			exitCode = 1
 		}
 	}
 
-	// Send terminal/output notification
-	notification := map[string]interface{}{
+	// Store result in terminal state
+	a.terminalMu.Lock()
+	if state, ok := a.terminals[terminalID]; ok {
+		state.output = string(output)
+		state.exitCode = exitCode
+		state.signal = signal
+		state.truncated = truncated
+		state.done = true
+		close(state.doneChan)
+	}
+	a.terminalMu.Unlock()
+
+	log.Printf("[ACP] Command completed: terminalId=%s, len=%d, exitCode=%d", terminalID, len(output), exitCode)
+
+	// Clean up old terminals after a delay
+	go func() {
+		time.Sleep(30 * time.Second)
+		a.terminalMu.Lock()
+		delete(a.terminals, terminalID)
+		a.terminalMu.Unlock()
+	}()
+}
+
+// handleTerminalWaitForExit handles terminal/wait_for_exit requests
+func (a *ACPAdapter) handleTerminalWaitForExit(msg map[string]interface{}) {
+	params, ok := msg["params"].(map[string]interface{})
+	if !ok {
+		log.Printf("[ACP] Invalid terminal/wait_for_exit params")
+		return
+	}
+
+	var reqID interface{}
+	if idVal, ok := msg["id"]; ok {
+		reqID = idVal
+	}
+
+	terminalID, _ := params["terminalId"].(string)
+
+	log.Printf("[ACP] Terminal wait for exit: id=%v, terminalId=%s", reqID, terminalID)
+
+	// Wait for command to complete
+	a.terminalMu.RLock()
+	state, ok := a.terminals[terminalID]
+	a.terminalMu.RUnlock()
+
+	if !ok {
+		// Terminal not found
+		errResp := map[string]interface{}{
+			"jsonrpc": "2.0",
+			"id":      reqID,
+			"error": map[string]interface{}{
+				"code":    -32602,
+				"message": "terminal not found",
+			},
+		}
+		a.sendJSONRPC(errResp)
+		return
+	}
+
+	// Wait for command to complete
+	<-state.doneChan
+
+	// Send response with exit status
+	response := map[string]interface{}{
 		"jsonrpc": "2.0",
-		"method":  "terminal/output",
-		"params": map[string]interface{}{
-			"sessionId":   sessionID,
-			"terminalId":  terminalID,
-			"output":      string(output),
-			"truncated":   truncated,
-			"exitStatus":  exitStatus,
+		"id":      reqID,
+		"result": map[string]interface{}{
+			"exitStatus": map[string]interface{}{
+				"exitCode": state.exitCode,
+			},
 		},
 	}
+	a.sendJSONRPC(response)
+}
 
-	log.Printf("[ACP] Command output: len=%d, exitCode=%v", len(output), exitStatus["exitCode"])
-	a.sendJSONRPC(notification)
+// handleTerminalOutputRequest handles terminal/output requests from agent
+func (a *ACPAdapter) handleTerminalOutputRequest(msg map[string]interface{}) {
+	params, ok := msg["params"].(map[string]interface{})
+	if !ok {
+		log.Printf("[ACP] Invalid terminal/output params")
+		return
+	}
+
+	var reqID interface{}
+	if idVal, ok := msg["id"]; ok {
+		reqID = idVal
+	}
+
+	terminalID, _ := params["terminalId"].(string)
+
+	log.Printf("[ACP] Terminal output request: id=%v, terminalId=%s", reqID, terminalID)
+
+	// Get terminal state
+	a.terminalMu.RLock()
+	state, ok := a.terminals[terminalID]
+	a.terminalMu.RUnlock()
+
+	if !ok {
+		// Terminal not found
+		errResp := map[string]interface{}{
+			"jsonrpc": "2.0",
+			"id":      reqID,
+			"error": map[string]interface{}{
+				"code":    -32602,
+				"message": "terminal not found",
+			},
+		}
+		a.sendJSONRPC(errResp)
+		return
+	}
+
+	// Wait for command to complete if not done
+	if !state.done {
+		<-state.doneChan
+	}
+
+	// Send response with output
+	response := map[string]interface{}{
+		"jsonrpc": "2.0",
+		"id":      reqID,
+		"result": map[string]interface{}{
+			"output":    state.output,
+			"truncated": state.truncated,
+			"exitStatus": map[string]interface{}{
+				"exitCode": state.exitCode,
+			},
+		},
+	}
+	a.sendJSONRPC(response)
 }
 
 // handleResponse processes JSON-RPC responses
