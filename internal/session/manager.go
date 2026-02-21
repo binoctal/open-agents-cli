@@ -101,8 +101,8 @@ func (m *Manager) CreateWithIDAndSize(cliType, workDir, sessionID string, cols, 
 func (m *Manager) getCLICommand(cliType string) (string, []string) {
 	switch cliType {
 	case "claude":
-		// Claude CLI doesn't support ACP yet, use PTY mode
-		return "claude", nil
+		// Claude Code ACP via npx
+		return "npx", []string{"@zed-industries/claude-code-acp"}
 	case "qwen":
 		return "qwen-code", []string{"--experimental-acp"}
 	case "goose":
