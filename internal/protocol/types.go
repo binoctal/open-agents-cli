@@ -12,6 +12,7 @@ const (
 	MessageTypePlan       MessageType = "plan"        // Task plan
 	MessageTypeError      MessageType = "error"       // Error message
 	MessageTypeCancel     MessageType = "cancel"      // Cancel/interrupt operation
+	MessageTypeUsage      MessageType = "usage"       // Token usage statistics
 )
 
 // AgentStatus represents the current state of the agent
@@ -55,4 +56,13 @@ type ToolCall struct {
 	Input  map[string]interface{} `json:"input"`
 	Status string                 `json:"status"` // "pending", "in_progress", "completed", "failed"
 	Result interface{}            `json:"result,omitempty"`
+}
+
+// UsageStats represents token usage statistics
+type UsageStats struct {
+	InputTokens    int `json:"inputTokens"`
+	OutputTokens   int `json:"outputTokens"`
+	CacheCreation  int `json:"cacheCreation"`
+	CacheRead      int `json:"cacheRead"`
+	ContextSize    int `json:"contextSize"`
 }

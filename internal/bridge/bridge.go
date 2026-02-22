@@ -209,6 +209,30 @@ func (b *Bridge) Start() error {
 				Timestamp: time.Now().UnixMilli(),
 			})
 
+		case protocol.MessageTypeUsage:
+			// Token usage statistics
+			usage, ok := msg.Content.(protocol.UsageStats)
+			if !ok {
+				log.Printf("[Bridge] Invalid usage stats type")
+				return
+			}
+			b.sendMessage(Message{
+				Type: "session:usage",
+				Payload: map[string]interface{}{
+					"sessionId": sessionID,
+					"deviceId":  b.config.DeviceID,
+					"usage": map[string]interface{}{
+						"inputTokens":   usage.InputTokens,
+						"outputTokens":  usage.OutputTokens,
+						"cacheCreation": usage.CacheCreation,
+						"cacheRead":     usage.CacheRead,
+						"contextSize":   usage.ContextSize,
+					},
+					"protocol": protocolName,
+				},
+				Timestamp: time.Now().UnixMilli(),
+			})
+
 		case protocol.MessageTypePlan:
 			// Task plan
 			b.sendMessage(Message{
@@ -386,6 +410,7 @@ func (b *Bridge) handleSessionStart(msg Message) {
 	cliType, _ := payload["cliType"].(string)
 	workDir, _ := payload["workDir"].(string)
 	initialCommand, _ := payload["command"].(string)
+	permissionMode, _ := payload["permissionMode"].(string)
 
 	// Get terminal size from payload
 	cols := 120 // default
@@ -397,7 +422,7 @@ func (b *Bridge) handleSessionStart(msg Message) {
 		rows = int(r)
 	}
 
-	log.Printf("[Bridge] sessionID=%s, cliType=%s, workDir=%s, cols=%d, rows=%d", sessionID, cliType, workDir, cols, rows)
+	log.Printf("[Bridge] sessionID=%s, cliType=%s, workDir=%s, cols=%d, rows=%d, permissionMode=%s", sessionID, cliType, workDir, cols, rows, permissionMode)
 
 	if cliType == "" {
 		cliType = "kiro" // default
@@ -406,7 +431,7 @@ func (b *Bridge) handleSessionStart(msg Message) {
 		workDir = "."
 	}
 
-	sess, err := b.sessions.CreateWithIDAndSize(cliType, workDir, sessionID, cols, rows)
+	sess, err := b.sessions.CreateWithIDAndSize(cliType, workDir, sessionID, cols, rows, permissionMode)
 	if err != nil {
 		log.Printf("Failed to create session: %v", err)
 		b.sendMessage(Message{

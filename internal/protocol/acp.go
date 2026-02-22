@@ -41,6 +41,9 @@ type ACPAdapter struct {
 	workDir     string
 	terminals   map[string]*terminalState // terminalId -> state
 	terminalMu  sync.RWMutex
+	// Token usage tracking (estimated)
+	inputTokens  atomic.Int64
+	outputTokens atomic.Int64
 }
 
 // NewACPAdapter creates a new ACP adapter
@@ -171,6 +174,10 @@ func (a *ACPAdapter) SendMessage(msg Message) error {
 		if !ok {
 			return fmt.Errorf("invalid content type")
 		}
+
+		// Estimate input tokens (roughly 4 characters per token)
+		tokens := estimateTokens(content)
+		a.inputTokens.Add(tokens)
 
 		log.Printf("[ACP] Sending prompt to session %s: %s", a.sessionID, content)
 
@@ -421,6 +428,10 @@ func (a *ACPAdapter) handleSessionUpdate(msg map[string]interface{}) {
 			return
 		}
 		text, _ := contentObj["text"].(string)
+
+		// Track output tokens
+		a.outputTokens.Add(estimateTokens(text))
+
 		a.emitMessage(Message{
 			Type:    MessageTypeContent,
 			Content: text,
@@ -435,6 +446,10 @@ func (a *ACPAdapter) handleSessionUpdate(msg map[string]interface{}) {
 			return
 		}
 		text, _ := contentObj["text"].(string)
+
+		// Track output tokens for thinking as well
+		a.outputTokens.Add(estimateTokens(text))
+
 		a.emitMessage(Message{
 			Type:    MessageTypeThought,
 			Content: text,
@@ -488,9 +503,27 @@ func (a *ACPAdapter) handleSessionUpdate(msg map[string]interface{}) {
 		})
 
 	case "end_turn":
+		// Send status update
 		a.emitMessage(Message{
 			Type:    MessageTypeStatus,
 			Content: StatusIdle,
+			Meta: map[string]interface{}{
+				"protocol": "acp",
+			},
+		})
+
+		// Send usage statistics
+		inputTokens := a.inputTokens.Load()
+		outputTokens := a.outputTokens.Load()
+		a.emitMessage(Message{
+			Type: MessageTypeUsage,
+			Content: UsageStats{
+				InputTokens:   int(inputTokens),
+				OutputTokens:  int(outputTokens),
+				CacheCreation: 0, // Not available from ACP
+				CacheRead:     0, // Not available from ACP
+				ContextSize:   int(inputTokens + outputTokens),
+			},
 			Meta: map[string]interface{}{
 				"protocol": "acp",
 			},
@@ -995,4 +1028,14 @@ func (a *ACPAdapter) sendJSONRPC(msg interface{}) error {
 // nextRequestID generates the next request ID
 func (a *ACPAdapter) nextRequestID() int64 {
 	return a.requestID.Add(1)
+}
+
+// estimateTokens provides a rough token count estimation
+// Uses approximately 4 characters per token (common for English text)
+func estimateTokens(text string) int64 {
+	if len(text) == 0 {
+		return 0
+	}
+	// Rough estimation: ~4 characters per token
+	return int64((len(text) + 3) / 4)
 }

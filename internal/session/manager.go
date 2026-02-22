@@ -18,12 +18,13 @@ type Manager struct {
 }
 
 type Session struct {
-	ID        string
-	CLIType   string
-	WorkDir   string
-	Status    string // "active", "completed", "error"
-	Protocol  *protocol.Manager
-	CreatedAt time.Time
+	ID             string
+	CLIType        string
+	WorkDir        string
+	PermissionMode string // "default", "plan", "accept-edits", "accept-all"
+	Status         string // "active", "completed", "error"
+	Protocol       *protocol.Manager
+	CreatedAt      time.Time
 }
 
 func NewManager() *Manager {
@@ -41,10 +42,10 @@ func (m *Manager) Create(cliType, workDir string) (*Session, error) {
 }
 
 func (m *Manager) CreateWithID(cliType, workDir, sessionID string) (*Session, error) {
-	return m.CreateWithIDAndSize(cliType, workDir, sessionID, 120, 30)
+	return m.CreateWithIDAndSize(cliType, workDir, sessionID, 120, 30, "default")
 }
 
-func (m *Manager) CreateWithIDAndSize(cliType, workDir, sessionID string, cols, rows int) (*Session, error) {
+func (m *Manager) CreateWithIDAndSize(cliType, workDir, sessionID string, cols, rows int, permissionMode string) (*Session, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -53,16 +54,22 @@ func (m *Manager) CreateWithIDAndSize(cliType, workDir, sessionID string, cols, 
 		sessionID = uuid.New().String()
 	}
 
+	// Default permission mode
+	if permissionMode == "" {
+		permissionMode = "default"
+	}
+
 	// Create protocol manager
 	protocolMgr := protocol.NewManager()
 
 	sess := &Session{
-		ID:        sessionID,
-		CLIType:   cliType,
-		WorkDir:   workDir,
-		Status:    "active",
-		Protocol:  protocolMgr,
-		CreatedAt: time.Now(),
+		ID:             sessionID,
+		CLIType:        cliType,
+		WorkDir:        workDir,
+		PermissionMode: permissionMode,
+		Status:         "active",
+		Protocol:       protocolMgr,
+		CreatedAt:      time.Now(),
 	}
 
 	// Set up message callback
@@ -95,6 +102,9 @@ func (m *Manager) CreateWithIDAndSize(cliType, workDir, sessionID string, cols, 
 		}
 	}
 
+	// Apply permission mode settings
+	m.applyPermissionMode(permissionMode, cliType, &config)
+
 	if err := protocolMgr.Connect(config); err != nil {
 		return nil, err
 	}
@@ -103,6 +113,64 @@ func (m *Manager) CreateWithIDAndSize(cliType, workDir, sessionID string, cols, 
 
 	m.sessions[sess.ID] = sess
 	return sess, nil
+}
+
+// applyPermissionMode configures the adapter based on permission mode
+func (m *Manager) applyPermissionMode(permissionMode, cliType string, config *protocol.AdapterConfig) {
+	log.Printf("[SessionManager] Applying permission mode: %s for CLI: %s", permissionMode, cliType)
+
+	// Initialize CustomEnv if nil
+	if config.CustomEnv == nil {
+		config.CustomEnv = make(map[string]string)
+	}
+
+	switch permissionMode {
+	case "accept-all":
+		// Auto-accept all operations
+		switch cliType {
+		case "claude":
+			config.CustomEnv["CLAUDE_PERMISSION_MODE"] = "accept-all"
+			config.Args = append(config.Args, "--dangerously-skip-permissions")
+		case "qwen":
+			config.CustomEnv["QWEN_PERMISSION_MODE"] = "accept-all"
+		case "goose":
+			config.CustomEnv["GOOSE_MODE"] = "auto"
+		case "gemini":
+			config.CustomEnv["GEMINI_PERMISSION_MODE"] = "accept-all"
+		}
+
+	case "accept-edits":
+		// Auto-accept file edits only
+		switch cliType {
+		case "claude":
+			config.CustomEnv["CLAUDE_PERMISSION_MODE"] = "accept-edits"
+		case "qwen":
+			config.CustomEnv["QWEN_PERMISSION_MODE"] = "accept-edits"
+		case "goose":
+			config.CustomEnv["GOOSE_MODE"] = "auto-edit"
+		case "gemini":
+			config.CustomEnv["GEMINI_PERMISSION_MODE"] = "accept-edits"
+		}
+
+	case "plan":
+		// Plan mode - show plan before execution
+		switch cliType {
+		case "claude":
+			config.CustomEnv["CLAUDE_PERMISSION_MODE"] = "plan"
+			config.Args = append(config.Args, "--plan")
+		case "qwen":
+			config.CustomEnv["QWEN_PERMISSION_MODE"] = "plan"
+		case "goose":
+			config.CustomEnv["GOOSE_MODE"] = "plan"
+		case "gemini":
+			config.CustomEnv["GEMINI_PERMISSION_MODE"] = "plan"
+		}
+
+	default:
+		// Default mode - ask for confirmation on sensitive operations
+		// Most CLIs use this as default, no env vars needed
+		log.Printf("[SessionManager] Using default permission mode")
+	}
 }
 
 func (m *Manager) getCLICommand(cliType string) (string, []string) {
