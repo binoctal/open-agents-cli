@@ -76,8 +76,21 @@ func (a *ACPAdapter) Connect(config AdapterConfig) error {
 	for k, v := range config.Env {
 		a.cmd.Env = append(a.cmd.Env, fmt.Sprintf("%s=%s", k, v))
 	}
+	// Handle CustomEnv - empty value means unset the variable
 	for k, v := range config.CustomEnv {
-		a.cmd.Env = append(a.cmd.Env, fmt.Sprintf("%s=%s", k, v))
+		if v == "" {
+			// Remove the variable from environment
+			newEnv := make([]string, 0, len(a.cmd.Env))
+			prefix := k + "="
+			for _, env := range a.cmd.Env {
+				if !strings.HasPrefix(env, prefix) {
+					newEnv = append(newEnv, env)
+				}
+			}
+			a.cmd.Env = newEnv
+		} else {
+			a.cmd.Env = append(a.cmd.Env, fmt.Sprintf("%s=%s", k, v))
+		}
 	}
 
 	// Setup pipes

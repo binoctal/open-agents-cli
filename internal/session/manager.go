@@ -88,6 +88,13 @@ func (m *Manager) CreateWithIDAndSize(cliType, workDir, sessionID string, cols, 
 		Rows:    rows,
 	}
 
+	// For claude CLI, unset CLAUDECODE to allow nested sessions
+	if cliType == "claude" {
+		config.CustomEnv = map[string]string{
+			"CLAUDECODE": "",
+		}
+	}
+
 	if err := protocolMgr.Connect(config); err != nil {
 		return nil, err
 	}
