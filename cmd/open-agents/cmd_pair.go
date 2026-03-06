@@ -17,27 +17,31 @@ import (
 
 var pairServerURL string
 
+// Default server URLs
+const (
+	defaultAPIURL = "https://open-agents-api-staging.binoctal.workers.dev"
+	defaultWebURL = "https://open-agents-web.pages.dev"
+)
+
 var pairCmd = &cobra.Command{
 	Use:   "pair",
 	Short: "Pair this device with your Open Agents account",
 	Long: `Pair this device with your Open Agents account using a pairing code.
 
-1. Go to your server's dashboard/devices page
+1. Go to the dashboard at https://open-agents-web.pages.dev/dashboard/devices
 2. Click "Add Device" to get a pairing code
 3. Enter the code when prompted
 
 Examples:
-  # Local development
-  open-agents pair --server http://localhost:8787
+  # Use default staging server
+  open-agents pair
 
-  # Custom server
-  open-agents pair --server https://your-server.com`,
+  # Local development
+  open-agents pair --server http://localhost:8787`,
 	Run: func(cmd *cobra.Command, args []string) {
-		// Server URL is required
+		// Use default staging API URL if not specified
 		if pairServerURL == "" {
-			fmt.Fprintln(os.Stderr, "Error: --server flag is required")
-			fmt.Fprintln(os.Stderr, "Example: open-agents pair --server http://localhost:8787")
-			os.Exit(1)
+			pairServerURL = defaultAPIURL
 		}
 
 		reader := bufio.NewReader(os.Stdin)
@@ -45,10 +49,17 @@ Examples:
 		fmt.Println("Open Agents Device Pairing")
 		fmt.Println("==========================")
 		fmt.Println()
-		fmt.Printf("Using server: %s\n", pairServerURL)
+		fmt.Printf("Using API server: %s\n", pairServerURL)
 
 		// Determine dashboard URL based on server
-		dashboardURL := strings.TrimSuffix(pairServerURL, "/") + "/dashboard/devices"
+		var dashboardURL string
+		if pairServerURL == defaultAPIURL {
+			dashboardURL = defaultWebURL + "/dashboard/devices"
+		} else if strings.Contains(pairServerURL, "localhost") {
+			dashboardURL = "http://localhost:5173/dashboard/devices"
+		} else {
+			dashboardURL = strings.TrimSuffix(pairServerURL, "/") + "/dashboard/devices"
+		}
 
 		fmt.Printf("1. Go to %s\n", dashboardURL)
 		fmt.Println("2. Click 'Add Device' to get a pairing code")
@@ -103,16 +114,16 @@ Examples:
 }
 
 func init() {
-	pairCmd.Flags().StringVarP(&pairServerURL, "server", "s", "", "Server URL (required, e.g., http://localhost:8787)")
+	pairCmd.Flags().StringVarP(&pairServerURL, "server", "s", "", "API server URL (default: staging server)")
 }
 
 type PairResponse struct {
-	Success     bool          `json:"success"`
-	UserID      string        `json:"userId"`
-	DeviceID    string        `json:"deviceId"`
-	DeviceToken string        `json:"deviceToken"`
-	ServerURL   string        `json:"serverUrl"`
-	WebPubKey   string        `json:"webPubKey,omitempty"`
+	Success     bool           `json:"success"`
+	UserID      string         `json:"userId"`
+	DeviceID    string         `json:"deviceId"`
+	DeviceToken string         `json:"deviceToken"`
+	ServerURL   string         `json:"serverUrl"`
+	WebPubKey   string         `json:"webPubKey,omitempty"`
 	Error       *ErrorResponse `json:"error,omitempty"`
 }
 

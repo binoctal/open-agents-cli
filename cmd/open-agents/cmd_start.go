@@ -2,7 +2,6 @@ package main
 
 import (
 	"fmt"
-	"log"
 	"os"
 	"os/signal"
 	"syscall"
@@ -14,33 +13,45 @@ import (
 	"github.com/spf13/cobra"
 )
 
+var (
+	logLevel string
+	headless bool
+)
+
 var startCmd = &cobra.Command{
 	Use:   "start",
 	Short: "Start the bridge daemon",
-	Long:  `Start the Open Agents bridge daemon in foreground mode.`,
+	Long:  `Start the Open Agents bridge daemon. This connects your
+local CLI tools to the cloud and enables remote monitoring
+and control.`,
 	Run: func(cmd *cobra.Command, args []string) {
 		// Setup rotating logger
 		l, err := logger.New()
-		if err == nil {
-			log.SetOutput(l.Writer())
-			defer l.Close()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error creating logger: %v\n", err)
+			os.Exit(1)
 		}
+		defer l.Close()
+
+		// Set log level from flag
+		logger.SetGlobalLevel(logLevel)
 
 		cfg, err := config.Load()
 		if err != nil {
-			log.Printf("Error loading config: %v", err)
-			fmt.Println("Please run 'open-agents pair' first to configure the bridge.")
-			os.Exit(1)
+				logger.Error("Error loading config: %v", err)
+				fmt.Println("Please run 'open-agents pair' first to configure the bridge.")
+				os.Exit(1)
 		}
 
-		log.Println("Starting Open Agents Bridge...")
-		log.Printf("Device ID: %s", cfg.DeviceID)
-		log.Printf("Server: %s", cfg.ServerURL)
+		logger.Info("Starting Open Agents Bridge...")
+		logger.Info("Device ID: %s", cfg.DeviceID)
+		logger.Info("Server: %s", cfg.ServerURL)
+		logger.Info("Log level: %s", logLevel)
 
 		b, err := bridge.New(cfg)
 		if err != nil {
-			log.Printf("Error creating bridge: %v", err)
-			os.Exit(1)
+				logger.Error("Error creating bridge: %v", err)
+				os.Exit(1)
 		}
 
 		// Setup system tray notification
@@ -52,16 +63,21 @@ var startCmd = &cobra.Command{
 		signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 
 		go func() {
-			<-sigChan
-			log.Println("Shutting down...")
-			t.SetRunning(false)
-			t.ShowNotification("Open Agents", "Bridge stopped")
-			b.Stop()
+				<-sigChan
+				logger.Info("Shutting down...")
+				t.SetRunning(false)
+				t.ShowNotification("Open Agents", "Bridge stopped")
+				b.Stop()
 		}()
 
 		if err := b.Start(); err != nil {
-			log.Printf("Bridge error: %v", err)
-			os.Exit(1)
+				logger.Error("Bridge error: %v", err)
+				os.Exit(1)
 		}
 	},
+}
+
+func init() {
+	startCmd.Flags().StringVarP(&logLevel, "log-level", "l", "info", "Log level (error, warn, info, debug)")
+	startCmd.Flags().BoolVarP(&headless, "headless", "H", false, "Run in headless mode (no system tray)")
 }

@@ -4,7 +4,6 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
-	"log"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -12,15 +11,38 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
+	"github.com/open-agents/bridge/internal/alert"
 	"github.com/open-agents/bridge/internal/api"
 	"github.com/open-agents/bridge/internal/config"
 	"github.com/open-agents/bridge/internal/crypto"
+	"github.com/open-agents/bridge/internal/logger"
+	"github.com/open-agents/bridge/internal/metrics"
 	"github.com/open-agents/bridge/internal/permission"
 	"github.com/open-agents/bridge/internal/protocol"
 	"github.com/open-agents/bridge/internal/rules"
 	"github.com/open-agents/bridge/internal/session"
 	"github.com/open-agents/bridge/internal/storage"
 )
+
+// logDebug logs debug messages
+func (b *Bridge) logDebug(format string, args ...interface{}) {
+	logger.Debug(format, args...)
+}
+
+// logInfo logs info messages
+func (b *Bridge) logInfo(format string, args ...interface{}) {
+	logger.Info(format, args...)
+}
+
+// logWarn logs warnings
+func (b *Bridge) logWarn(format string, args ...interface{}) {
+	logger.Warn(format, args...)
+}
+
+// logError logs errors
+func (b *Bridge) logError(format string, args ...interface{}) {
+	logger.Error(format, args...)
+}
 
 type Bridge struct {
 	config       *config.Config
@@ -69,7 +91,7 @@ func New(cfg *config.Config) (*Bridge, error) {
 			b.keyPair = &crypto.KeyPair{}
 			copy(b.keyPair.PrivateKey[:], privBytes)
 			copy(b.keyPair.PublicKey[:], pubBytes)
-			log.Println("E2EE: Keys loaded")
+			logger.Info("E2EE: Keys loaded")
 		}
 	}
 
@@ -77,13 +99,30 @@ func New(cfg *config.Config) (*Bridge, error) {
 		b.webPubKey, _ = crypto.PublicKeyFromBase64(cfg.WebPubKey)
 	}
 
+	// Initialize metrics
+	metrics.Init(cfg.DeviceID, "1.0.0")
+
+	// Initialize alert system
+	alert.Init(alert.Config{
+		Enabled:   true,
+		Cooldown:  5 * time.Minute,
+		MaxAlerts: 100,
+	})
+
+	// Register health checks
+	metrics.RegisterHealthCheck("memory", metrics.MemoryHealthChecker(1024)) // 1GB max
+	metrics.RegisterHealthCheck("goroutines", metrics.GoroutineHealthChecker(1000))
+	metrics.RegisterHealthCheck("websocket", metrics.WebSocketHealthChecker(func() bool {
+		return b.conn != nil
+	}))
+
 	return b, nil
 }
 
 func (b *Bridge) Start() error {
 	// Start permission server
 	if err := b.permServer.Start(); err != nil {
-		log.Printf("Warning: Could not start permission server: %v", err)
+		b.logWarn("Could not start permission server: %v", err)
 	}
 
 	// Sync rules from API on startup
@@ -109,11 +148,11 @@ func (b *Bridge) Start() error {
 
 		switch action {
 		case "auto-approve":
-			log.Printf("Auto-approved by rule %s: %s", ruleID, req.Description)
+			b.logInfo("Auto-approved by rule %s: %s", ruleID, req.Description)
 			b.permHandler.Resolve(permission.Response{ID: req.ID, Approved: true})
 			return
 		case "deny":
-			log.Printf("Auto-denied by rule %s: %s", ruleID, req.Description)
+			b.logInfo("Auto-denied by rule %s: %s", ruleID, req.Description)
 			b.permHandler.Resolve(permission.Response{ID: req.ID, Approved: false})
 			return
 		}
@@ -128,7 +167,24 @@ func (b *Bridge) Start() error {
 
 	// Set up session output forwarding
 	b.sessions.SetOutputCallback(func(sessionID string, msg protocol.Message) {
-		log.Printf("[Bridge] Forwarding protocol message: sessionId=%s, type=%s", sessionID, msg.Type)
+		// Record metrics
+		metrics.RecordMessage(sessionID)
+
+		// Show content preview (first 50 chars)
+		var contentPreview string
+		if str, ok := msg.Content.(string); ok {
+			if len(str) > 50 {
+				contentPreview = str[:50] + "..."
+			} else {
+				contentPreview = str
+			}
+		} else {
+			contentPreview = fmt.Sprintf("%v", msg.Content)
+			if len(contentPreview) > 50 {
+				contentPreview = contentPreview[:50] + "..."
+			}
+		}
+		b.logInfo("[Bridge] Forwarding: session=%s, type=%s, content=\"%s\"", sessionID, msg.Type, contentPreview)
 		
 		// Get session to check protocol
 		sess := b.sessions.Get(sessionID)
@@ -165,6 +221,9 @@ func (b *Bridge) Start() error {
 			})
 
 		case protocol.MessageTypeToolCall:
+			// Record tool call metric
+			metrics.RecordToolCall(sessionID, fmt.Sprintf("%v", msg.Content))
+
 			// Tool invocation
 			b.sendMessage(Message{
 				Type: "tool:call",
@@ -213,9 +272,13 @@ func (b *Bridge) Start() error {
 			// Token usage statistics
 			usage, ok := msg.Content.(protocol.UsageStats)
 			if !ok {
-				log.Printf("[Bridge] Invalid usage stats type")
+				b.logInfo("[Bridge] Invalid usage stats type")
 				return
 			}
+
+			// Record token usage metrics
+			metrics.RecordTokenUsage(sessionID, int64(usage.InputTokens), int64(usage.OutputTokens), int64(usage.CacheCreation), int64(usage.CacheRead))
+
 			b.sendMessage(Message{
 				Type: "session:usage",
 				Payload: map[string]interface{}{
@@ -247,6 +310,9 @@ func (b *Bridge) Start() error {
 			})
 
 		case protocol.MessageTypeError:
+			// Record error metric
+			metrics.RecordError(sessionID, "protocol")
+
 			// Error message
 			b.sendMessage(Message{
 				Type: "session:error",
@@ -325,18 +391,18 @@ func (b *Bridge) connect() error {
 	u.RawQuery = q.Encode()
 	u.Path = fmt.Sprintf("/ws/%s", b.config.UserID)
 
-	log.Printf("Connecting to %s", u.String())
+	b.logInfo("Connecting to %s", u.String())
 
 	conn, _, err := websocket.DefaultDialer.Dial(u.String(), nil)
 	if err != nil {
 		// For demo, continue without connection
-		log.Printf("Warning: Could not connect to server: %v", err)
-		log.Println("Running in offline mode...")
+		b.logInfo("Warning: Could not connect to server: %v", err)
+		b.logInfo("Running in offline mode...")
 		return nil
 	}
 
 	b.conn = conn
-	log.Println("Connected to server")
+	b.logInfo("Connected to server")
 	return nil
 }
 
@@ -352,14 +418,14 @@ func (b *Bridge) readLoop() {
 		default:
 			_, data, err := b.conn.ReadMessage()
 			if err != nil {
-				log.Printf("WebSocket read error: %v", err)
+				b.logInfo("WebSocket read error: %v", err)
 				b.reconnect()
 				continue
 			}
 
 			var msg Message
 			if err := json.Unmarshal(data, &msg); err != nil {
-				log.Printf("Failed to parse message: %v", err)
+				b.logInfo("Failed to parse message: %v", err)
 				continue
 			}
 
@@ -369,7 +435,7 @@ func (b *Bridge) readLoop() {
 }
 
 func (b *Bridge) handleMessage(msg Message) {
-	log.Printf("[Bridge] Received message type: %s, payload: %+v", msg.Type, msg.Payload)
+	b.logInfo("[Bridge] Received message type: %s, payload: %+v", msg.Type, msg.Payload)
 	switch msg.Type {
 	case "session:start":
 		b.handleSessionStart(msg)
@@ -393,16 +459,39 @@ func (b *Bridge) handleMessage(msg Message) {
 		b.handleRulesSync(msg)
 	case "storage:sync":
 		b.handleStorageSync(msg)
+	case "device:restart":
+		b.handleDeviceRestart(msg)
 	default:
-		log.Printf("Unknown message type: %s", msg.Type)
+		b.logInfo("Unknown message type: %s", msg.Type)
 	}
 }
 
-func (b *Bridge) handleSessionStart(msg Message) {
-	log.Printf("[Bridge] handleSessionStart called")
+// handleDeviceRestart handles restart command from web
+func (b *Bridge) handleDeviceRestart(msg Message) {
+	b.logInfo("[Bridge] Received restart command")
 	payload, ok := msg.Payload.(map[string]interface{})
 	if !ok {
-		log.Printf("[Bridge] handleSessionStart: invalid payload type")
+		b.logError("Invalid restart payload")
+		return
+	}
+
+	deviceId, _ := payload["deviceId"].(string)
+	if deviceId != b.config.DeviceID {
+		b.logInfo("Restart command not for this device (got %s, expected %s)", deviceId, b.config.DeviceID)
+		return
+	}
+
+	b.logInfo("[Bridge] Restarting bridge...")
+	b.Stop()
+	// Exit the process - the service manager or user will restart it
+	os.Exit(0)
+}
+
+func (b *Bridge) handleSessionStart(msg Message) {
+	b.logInfo("[Bridge] handleSessionStart called")
+	payload, ok := msg.Payload.(map[string]interface{})
+	if !ok {
+		b.logInfo("[Bridge] handleSessionStart: invalid payload type")
 		return
 	}
 
@@ -422,7 +511,7 @@ func (b *Bridge) handleSessionStart(msg Message) {
 		rows = int(r)
 	}
 
-	log.Printf("[Bridge] sessionID=%s, cliType=%s, workDir=%s, cols=%d, rows=%d, permissionMode=%s", sessionID, cliType, workDir, cols, rows, permissionMode)
+	b.logInfo("[Bridge] sessionID=%s, cliType=%s, workDir=%s, cols=%d, rows=%d, permissionMode=%s", sessionID, cliType, workDir, cols, rows, permissionMode)
 
 	if cliType == "" {
 		cliType = "kiro" // default
@@ -433,7 +522,8 @@ func (b *Bridge) handleSessionStart(msg Message) {
 
 	sess, err := b.sessions.CreateWithIDAndSize(cliType, workDir, sessionID, cols, rows, permissionMode)
 	if err != nil {
-		log.Printf("Failed to create session: %v", err)
+		b.logError("Failed to create session: %v", err)
+		metrics.RecordError(sessionID, "session_create")
 		b.sendMessage(Message{
 			Type: "session:error",
 			Payload: map[string]interface{}{
@@ -456,6 +546,9 @@ func (b *Bridge) handleSessionStart(msg Message) {
 		Timestamp: time.Now().UnixMilli(),
 	})
 
+	// Start session metrics
+	metrics.StartSession(sess.ID)
+
 	// Send initial command if provided
 	if initialCommand != "" {
 		sess.Send(initialCommand)
@@ -473,12 +566,12 @@ func (b *Bridge) handleSessionSend(msg Message) {
 
 	sess := b.sessions.Get(sessionID)
 	if sess == nil {
-		log.Printf("Session not found: %s", sessionID)
+		b.logInfo("Session not found: %s", sessionID)
 		return
 	}
 
 	if err := sess.Send(content); err != nil {
-		log.Printf("Send error: %v", err)
+		b.logInfo("Send error: %v", err)
 	}
 }
 
@@ -490,8 +583,11 @@ func (b *Bridge) handleSessionStop(msg Message) {
 
 	sessionID, _ := payload["sessionId"].(string)
 	if err := b.sessions.Stop(sessionID); err != nil {
-		log.Printf("Failed to stop session: %v", err)
+		b.logInfo("Failed to stop session: %v", err)
 	}
+
+	// End session metrics
+	metrics.EndSession(sessionID)
 
 	// Send session stopped notification
 	b.sendMessage(Message{
@@ -511,12 +607,12 @@ func (b *Bridge) handleSessionCancel(msg Message) {
 	}
 
 	sessionID, _ := payload["sessionId"].(string)
-	log.Printf("[Bridge] Cancelling session: %s", sessionID)
+	b.logInfo("[Bridge] Cancelling session: %s", sessionID)
 
 	// Send cancel to the session (ACP protocol)
 	sess := b.sessions.Get(sessionID)
 	if sess == nil {
-		log.Printf("Session not found: %s", sessionID)
+		b.logInfo("Session not found: %s", sessionID)
 		return
 	}
 
@@ -556,16 +652,16 @@ func (b *Bridge) handleSessionResize(msg Message) {
 		rows = int(r)
 	}
 
-	log.Printf("[Bridge] Resizing session %s to %dx%d", sessionID, cols, rows)
+	b.logInfo("[Bridge] Resizing session %s to %dx%d", sessionID, cols, rows)
 	if err := b.sessions.Resize(sessionID, cols, rows); err != nil {
-		log.Printf("Failed to resize session: %v", err)
+		b.logInfo("Failed to resize session: %v", err)
 	}
 }
 
 func (b *Bridge) handlePermissionResponse(msg Message) {
 	payload, ok := msg.Payload.(map[string]interface{})
 	if !ok {
-		log.Printf("Invalid permission response payload")
+		b.logInfo("Invalid permission response payload")
 		return
 	}
 
@@ -577,7 +673,7 @@ func (b *Bridge) handlePermissionResponse(msg Message) {
 	approved, _ := payload["approved"].(bool)
 	optionID, _ := payload["optionId"].(string)
 
-	log.Printf("[Bridge] Permission response: id=%v, approved=%v, optionId=%s", id, approved, optionID)
+	b.logInfo("[Bridge] Permission response: id=%v, approved=%v, optionId=%s", id, approved, optionID)
 
 	// Convert ID to string for internal permission handler
 	var idStr string
@@ -594,13 +690,16 @@ func (b *Bridge) handlePermissionResponse(msg Message) {
 		Approved: approved,
 	})
 
+	// Record permission metric
+	metrics.RecordPermission("", approved)
+
 	// Also send to ACP protocol if optionId is provided
 	if optionID != "" {
 		// Find session by permission ID (stored in permission handler)
 		// For now, send to all active sessions
 		for _, sess := range b.sessions.List() {
 			if sess.Protocol != nil && sess.Protocol.GetProtocolName() == "acp" {
-				log.Printf("[Bridge] Sending permission response to ACP session: %s", sess.ID)
+				b.logInfo("[Bridge] Sending permission response to ACP session: %s", sess.ID)
 				sess.Protocol.SendMessage(protocol.Message{
 					Type: protocol.MessageTypePermission,
 					Content: protocol.PermissionResponse{
@@ -620,7 +719,7 @@ func (b *Bridge) handleControlTakeover(msg Message) {
 	}
 
 	sessionID, _ := payload["sessionId"].(string)
-	log.Printf("Control takeover for session: %s", sessionID)
+	b.logInfo("Control takeover for session: %s", sessionID)
 }
 
 func (b *Bridge) handleConfigSync(msg Message) {
@@ -641,7 +740,7 @@ func (b *Bridge) handleConfigSync(msg Message) {
 		for k, v := range b.config.EnvVars {
 			os.Setenv(k, v)
 		}
-		log.Printf("Synced %d environment variables", len(b.config.EnvVars))
+		b.logInfo("Synced %d environment variables", len(b.config.EnvVars))
 	}
 
 	// Sync CLI enabled status
@@ -652,7 +751,7 @@ func (b *Bridge) handleConfigSync(msg Message) {
 				b.config.CLIEnabled[k] = bv
 			}
 		}
-		log.Printf("Synced CLI enabled: %v", b.config.CLIEnabled)
+		b.logInfo("Synced CLI enabled: %v", b.config.CLIEnabled)
 	}
 
 	// Sync permissions
@@ -663,12 +762,12 @@ func (b *Bridge) handleConfigSync(msg Message) {
 				b.config.Permissions[k] = bv
 			}
 		}
-		log.Printf("Synced permissions: %v", b.config.Permissions)
+		b.logInfo("Synced permissions: %v", b.config.Permissions)
 	}
 
 	// Save config
 	if err := config.Save(b.config); err != nil {
-		log.Printf("Failed to save config: %v", err)
+		b.logInfo("Failed to save config: %v", err)
 	}
 
 	// Send ack
@@ -707,7 +806,7 @@ func (b *Bridge) handleRulesSync(msg Message) {
 	b.rulesEngine.UpdateRules(newRules)
 	config.Save(b.config)
 
-	log.Printf("Synced %d auto-approval rules", len(newRules))
+	b.logInfo("Synced %d auto-approval rules", len(newRules))
 
 	b.sendMessage(Message{
 		Type:      "rules:synced",
@@ -739,7 +838,7 @@ func (b *Bridge) handleStorageSync(msg Message) {
 	}
 
 	config.Save(b.config)
-	log.Printf("Storage type set to: %s", storageType)
+	b.logInfo("Storage type set to: %s", storageType)
 
 	b.sendMessage(Message{
 		Type:      "storage:synced",
@@ -764,20 +863,20 @@ func (b *Bridge) handleChatSend(msg Message) {
 	sessionID, _ := payload["sessionId"].(string)
 	content, _ := payload["content"].(string)
 
-	log.Printf("Chat message for session %s: %s", sessionID, content)
+	b.logInfo("Chat message for session %s: %s", sessionID, content)
 
 	sess := b.sessions.Get(sessionID)
 	if sess == nil {
 		var err error
 		sess, err = b.sessions.Create("kiro", ".")
 		if err != nil {
-			log.Printf("Failed to create session: %v", err)
+			b.logError("Failed to create session: %v", err)
 			return
 		}
 	}
 
 	if err := sess.Send(content); err != nil {
-		log.Printf("Failed to send to CLI: %v", err)
+		b.logInfo("Failed to send to CLI: %v", err)
 	}
 }
 
@@ -786,7 +885,7 @@ func (b *Bridge) sendMessage(msg Message) error {
 	defer b.mu.Unlock()
 
 	if b.conn == nil {
-		log.Printf("Offline: %s", msg.Type)
+		b.logInfo("Offline: %s", msg.Type)
 		return nil
 	}
 
@@ -799,7 +898,7 @@ func (b *Bridge) sendMessage(msg Message) error {
 	if b.keyPair != nil && b.webPubKey != nil {
 		encrypted, err := b.keyPair.Encrypt(data, b.webPubKey)
 		if err != nil {
-			log.Printf("Encryption failed: %v", err)
+			b.logInfo("Encryption failed: %v", err)
 			return b.conn.WriteMessage(websocket.TextMessage, data)
 		}
 
@@ -834,9 +933,12 @@ func (b *Bridge) heartbeat() {
 }
 
 func (b *Bridge) reconnect() {
-	log.Println("Reconnecting...")
+	b.logInfo("Reconnecting...")
+	alert.WebSocketDisconnected("connection lost")
 	time.Sleep(5 * time.Second)
-	b.connect()
+	if err := b.connect(); err == nil && b.conn != nil {
+		alert.WebSocketReconnected()
+	}
 }
 
 func getDeviceName() string {
@@ -851,7 +953,7 @@ func getDeviceName() string {
 func (b *Bridge) syncRulesFromAPI() {
 	rules, err := b.apiClient.GetPermissionRules("")
 	if err != nil {
-		log.Printf("Failed to sync rules from API: %v", err)
+		b.logInfo("Failed to sync rules from API: %v", err)
 		return
 	}
 
@@ -868,7 +970,7 @@ func (b *Bridge) syncRulesFromAPI() {
 	b.config.Rules = configRules
 	b.rulesEngine.UpdateRules(configRules)
 	config.Save(b.config)
-	log.Printf("Synced %d rules from API", len(configRules))
+	b.logInfo("Synced %d rules from API", len(configRules))
 }
 
 // ReportSessionToAPI reports session status to API
@@ -880,7 +982,7 @@ func (b *Bridge) ReportSessionToAPI(sessionID, cliType, workDir, status string) 
 		Status:    status,
 	})
 	if err != nil {
-		log.Printf("Failed to report session to API: %v", err)
+		b.logInfo("Failed to report session to API: %v", err)
 	}
 }
 

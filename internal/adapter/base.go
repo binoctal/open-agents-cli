@@ -10,6 +10,11 @@ import (
 	"github.com/open-agents/bridge/internal/logger"
 )
 
+// getSocketPath returns the Open Agents socket path from environment
+func getSocketPath() string {
+	return os.Getenv("OPEN_AGENTS_SOCKET_PATH")
+}
+
 // BaseAdapter provides common functionality for CLI adapters
 type BaseAdapter struct {
 	name           string
@@ -18,6 +23,7 @@ type BaseAdapter struct {
 	cmd            *exec.Cmd
 	ptmx           *os.File // PTY master file descriptor
 	running        bool
+	extraEnv       []string // Additional environment variables
 	outputCallback func(OutputEvent)
 	permCallback   func(PermissionRequest) PermissionResponse
 	exitCallback   func(int)
@@ -41,7 +47,7 @@ func (a *BaseAdapter) StartWithSize(workDir string, args []string, cols, rows in
 
 	a.cmd = exec.Command(a.command, args...)
 	a.cmd.Dir = workDir
-	a.cmd.Env = os.Environ()
+	a.cmd.Env = append(os.Environ(), a.extraEnv...)
 
 	// Start with PTY (pseudo-terminal) - required for interactive CLIs like claude
 	ptmx, err := pty.StartWithSize(a.cmd, &pty.Winsize{

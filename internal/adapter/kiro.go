@@ -1,156 +1,39 @@
 package adapter
 
-import (
-	"bufio"
-	"io"
-	"os"
-	"os/exec"
-	"sync"
-)
-
 // KiroAdapter implements the Adapter interface for Kiro CLI
 type KiroAdapter struct {
-	cmd            *exec.Cmd
-	stdin          io.WriteCloser
-	running        bool
-	outputCallback func(OutputEvent)
-	permCallback   func(PermissionRequest) PermissionResponse
-	exitCallback   func(int)
-	mu             sync.Mutex
+	BaseAdapter
 }
 
 func NewKiroAdapter() *KiroAdapter {
-	return &KiroAdapter{}
+	return &KiroAdapter{
+		BaseAdapter: BaseAdapter{
+			name:        "kiro",
+			displayName: "Kiro CLI",
+			command:     "kiro",
+			extraEnv: []string{
+				"KIRO_HOOKS_ENABLED=true",
+			},
+		},
+	}
 }
 
 func (a *KiroAdapter) Name() string {
-	return "kiro"
+	return a.name
 }
 
 func (a *KiroAdapter) DisplayName() string {
-	return "Kiro CLI"
-}
-
-func (a *KiroAdapter) IsInstalled() bool {
-	_, err := exec.LookPath("kiro")
-	return err == nil
+	return a.displayName
 }
 
 func (a *KiroAdapter) Start(workDir string, args []string) error {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-
+	// Kiro requires --headless flag for non-interactive use
 	cmdArgs := append([]string{"--headless"}, args...)
-	a.cmd = exec.Command("kiro", cmdArgs...)
-	a.cmd.Dir = workDir
-	a.cmd.Env = append(os.Environ(), "KIRO_HOOKS_ENABLED=true")
-
-	var err error
-	a.stdin, err = a.cmd.StdinPipe()
-	if err != nil {
-		return err
-	}
-
-	stdout, err := a.cmd.StdoutPipe()
-	if err != nil {
-		return err
-	}
-
-	stderr, err := a.cmd.StderrPipe()
-	if err != nil {
-		return err
-	}
-
-	if err := a.cmd.Start(); err != nil {
-		return err
-	}
-
-	a.running = true
-
-	// Read stdout
-	go a.readOutput(stdout, "stdout")
-	go a.readOutput(stderr, "stderr")
-
-	// Wait for exit
-	go func() {
-		err := a.cmd.Wait()
-		a.mu.Lock()
-		a.running = false
-		a.mu.Unlock()
-
-		exitCode := 0
-		if err != nil {
-			if exitErr, ok := err.(*exec.ExitError); ok {
-				exitCode = exitErr.ExitCode()
-			}
-		}
-
-		if a.exitCallback != nil {
-			a.exitCallback(exitCode)
-		}
-	}()
-
-	return nil
-}
-
-func (a *KiroAdapter) readOutput(r io.Reader, outputType string) {
-	scanner := bufio.NewScanner(r)
-	for scanner.Scan() {
-		if a.outputCallback != nil {
-			a.outputCallback(OutputEvent{
-				Type:    outputType,
-				Content: scanner.Text(),
-			})
-		}
-	}
-}
-
-func (a *KiroAdapter) Stop() error {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-
-	if a.cmd != nil && a.cmd.Process != nil {
-		return a.cmd.Process.Kill()
-	}
-	return nil
-}
-
-func (a *KiroAdapter) IsRunning() bool {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	return a.running
-}
-
-func (a *KiroAdapter) Send(input string) error {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-
-	if a.stdin == nil {
-		return nil
-	}
-
-	_, err := a.stdin.Write([]byte(input + "\n"))
-	return err
-}
-
-func (a *KiroAdapter) OnOutput(callback func(OutputEvent)) {
-	a.outputCallback = callback
-}
-
-func (a *KiroAdapter) OnPermission(callback func(PermissionRequest) PermissionResponse) {
-	a.permCallback = callback
-}
-
-func (a *KiroAdapter) OnExit(callback func(int)) {
-	a.exitCallback = callback
-}
-
-func (a *KiroAdapter) Resize(cols, rows int) error {
-	// TODO: Implement PTY resize for Kiro
-	return nil
+	return a.BaseAdapter.Start(workDir, cmdArgs)
 }
 
 func (a *KiroAdapter) StartWithSize(workDir string, args []string, cols, rows int) error {
-	// Kiro uses stdin/stdout, not PTY, so size is ignored
-	return a.Start(workDir, args)
+	// Kiro requires --headless flag for non-interactive use
+	cmdArgs := append([]string{"--headless"}, args...)
+	return a.BaseAdapter.StartWithSize(workDir, cmdArgs, cols, rows)
 }

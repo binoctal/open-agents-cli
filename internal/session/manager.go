@@ -198,7 +198,19 @@ func (m *Manager) getCLICommand(cliType string) (string, []string) {
 func (m *Manager) Get(id string) *Session {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	return m.sessions[id]
+	sess := m.sessions[id]
+	if sess == nil {
+		log.Printf("[SessionManager] Session not found: %s. Active sessions: %v", id, m.getSessionIDs())
+	}
+	return sess
+}
+
+func (m *Manager) getSessionIDs() []string {
+	ids := make([]string, 0, len(m.sessions))
+	for id := range m.sessions {
+		ids = append(ids, id)
+	}
+	return ids
 }
 
 func (m *Manager) List() []*Session {
