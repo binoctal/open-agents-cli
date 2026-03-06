@@ -30,6 +30,9 @@ type Config struct {
 
 	// v1.3: Logging settings
 	LogLevel string `json:"logLevel,omitempty"` // debug, info, warn, error (default: info)
+
+	// v1.4: Synced prompts from Web
+	Prompts interface{} `json:"prompts,omitempty"`
 }
 
 type AutoApprovalRule struct {

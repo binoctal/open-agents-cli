@@ -19,8 +19,8 @@ var pairServerURL string
 
 // Default server URLs
 const (
-	defaultAPIURL = "https://open-agents-api-staging.binoctal.workers.dev"
-	defaultWebURL = "https://open-agents-web.pages.dev"
+	defaultAPIURL = "https://api.openagents.top"
+	defaultWebURL = "https://openagents.top"
 )
 
 var pairCmd = &cobra.Command{

@@ -461,6 +461,18 @@ func (b *Bridge) handleMessage(msg Message) {
 		b.handleStorageSync(msg)
 	case "device:restart":
 		b.handleDeviceRestart(msg)
+	case "prompts:sync":
+		b.handlePromptsSync(msg)
+	case "multiagent:start_job":
+		b.handleMultiAgentStartJob(msg)
+	case "multiagent:pause_job":
+		b.handleMultiAgentPauseJob(msg)
+	case "multiagent:cancel_job":
+		b.handleMultiAgentCancelJob(msg)
+	case "multiagent:start_task":
+		b.handleMultiAgentStartTask(msg)
+	case "acp:query_status":
+		b.handleACPQueryStatus(msg)
 	default:
 		b.logInfo("Unknown message type: %s", msg.Type)
 	}
@@ -991,4 +1003,149 @@ type Message struct {
 	Type      string      `json:"type"`
 	Payload   interface{} `json:"payload"`
 	Timestamp int64       `json:"timestamp"`
+}
+
+// handlePromptsSync handles prompt sync from web
+func (b *Bridge) handlePromptsSync(msg Message) {
+	payload, ok := msg.Payload.(map[string]interface{})
+	if !ok {
+		b.logInfo("Invalid prompts:sync payload")
+		return
+	}
+
+	deviceId := getString(payload, "deviceId")
+
+	// Store prompts locally in config
+	if prompts, ok := payload["prompts"]; ok {
+		b.config.Prompts = prompts
+		config.Save(b.config)
+		b.logInfo("Synced prompts to local config")
+	}
+
+	// Send ack back
+	b.sendMessage(Message{
+		Type: "prompts:synced",
+		Payload: map[string]interface{}{
+			"deviceId": deviceId,
+			"success":  true,
+		},
+		Timestamp: time.Now().UnixMilli(),
+	})
+}
+
+// handleMultiAgentStartJob handles starting a multi-agent job
+func (b *Bridge) handleMultiAgentStartJob(msg Message) {
+	payload, ok := msg.Payload.(map[string]interface{})
+	if !ok {
+		return
+	}
+
+	jobId := getString(payload, "jobId")
+	b.logInfo("Multi-agent job started: %s", jobId)
+
+	// Get tasks from payload
+	tasks, _ := payload["tasks"].([]interface{})
+	for _, t := range tasks {
+		task, ok := t.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		taskId := getString(task, "id")
+		// Notify web that task has started
+		b.sendMessage(Message{
+			Type: "multiagent:task_started",
+			Payload: map[string]interface{}{
+				"jobId":  jobId,
+				"taskId": taskId,
+			},
+			Timestamp: time.Now().UnixMilli(),
+		})
+	}
+}
+
+// handleMultiAgentPauseJob handles pausing a multi-agent job
+func (b *Bridge) handleMultiAgentPauseJob(msg Message) {
+	payload, ok := msg.Payload.(map[string]interface{})
+	if !ok {
+		return
+	}
+	jobId := getString(payload, "jobId")
+	b.logInfo("Multi-agent job paused: %s", jobId)
+}
+
+// handleMultiAgentCancelJob handles cancelling a multi-agent job
+func (b *Bridge) handleMultiAgentCancelJob(msg Message) {
+	payload, ok := msg.Payload.(map[string]interface{})
+	if !ok {
+		return
+	}
+	jobId := getString(payload, "jobId")
+	b.logInfo("Multi-agent job cancelled: %s", jobId)
+}
+
+// handleMultiAgentStartTask handles starting a specific task in a job
+func (b *Bridge) handleMultiAgentStartTask(msg Message) {
+	payload, ok := msg.Payload.(map[string]interface{})
+	if !ok {
+		return
+	}
+
+	jobId := getString(payload, "jobId")
+	taskId := getString(payload, "taskId")
+	agentId := getString(payload, "agentId")
+
+	b.logInfo("Starting multi-agent task %s (agent: %s) in job %s", taskId, agentId, jobId)
+
+	// Notify progress
+	b.sendMessage(Message{
+		Type: "multiagent:task_started",
+		Payload: map[string]interface{}{
+			"jobId":  jobId,
+			"taskId": taskId,
+		},
+		Timestamp: time.Now().UnixMilli(),
+	})
+}
+
+// handleACPQueryStatus responds with current protocol status for all sessions
+func (b *Bridge) handleACPQueryStatus(msg Message) {
+	b.logInfo("[Bridge] Received ACP status query")
+
+	sessions := b.sessions.List()
+	sessionInfos := make([]map[string]interface{}, 0, len(sessions))
+	hasACP := false
+
+	for _, sess := range sessions {
+		proto := sess.GetProtocolName()
+		if proto == "acp" {
+			hasACP = true
+		}
+
+		var capabilities []string
+		if sess.Protocol != nil {
+			adapter := sess.Protocol.GetAdapter()
+			if adapter != nil {
+				capabilities = adapter.Capabilities()
+			}
+		}
+
+		sessionInfos = append(sessionInfos, map[string]interface{}{
+			"id":           sess.ID,
+			"cliType":      sess.CLIType,
+			"protocol":     proto,
+			"status":       sess.Status,
+			"capabilities": capabilities,
+			"createdAt":    sess.CreatedAt.Format(time.RFC3339),
+		})
+	}
+
+	b.sendMessage(Message{
+		Type: "acp:status",
+		Payload: map[string]interface{}{
+			"deviceId":    b.config.DeviceID,
+			"supportsAcp": hasACP,
+			"sessions":    sessionInfos,
+		},
+		Timestamp: time.Now().UnixMilli(),
+	})
 }
