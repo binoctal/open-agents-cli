@@ -36,6 +36,9 @@ type Config struct {
 
 	// v2.2: Model fallback chain
 	ModelFallbacks []ModelFallback `json:"modelFallbacks,omitempty"`
+
+	// v2.3: Security scanner
+	ScannerEnabled *bool `json:"scannerEnabled,omitempty"` // nil = default (true)
 }
 
 type ModelFallback struct {
@@ -110,4 +113,18 @@ func Save(cfg *Config) error {
 	}
 
 	return os.WriteFile(ConfigPath(), data, 0600)
+}
+
+// SaveScannerRules persists custom scanner rules to a separate file.
+func SaveScannerRules(rules interface{}) error {
+	dir := ConfigDir()
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		return err
+	}
+	wrapper := map[string]interface{}{"customRules": rules}
+	data, err := json.MarshalIndent(wrapper, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(filepath.Join(dir, "scanner-rules.json"), data, 0600)
 }

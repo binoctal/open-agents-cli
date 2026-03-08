@@ -22,6 +22,7 @@ import (
 	"github.com/open-agents/bridge/internal/permission"
 	"github.com/open-agents/bridge/internal/protocol"
 	"github.com/open-agents/bridge/internal/rules"
+	"github.com/open-agents/bridge/internal/scanner"
 	"github.com/open-agents/bridge/internal/session"
 	"github.com/open-agents/bridge/internal/storage"
 )
@@ -61,6 +62,7 @@ type Bridge struct {
 	done         chan struct{}
 	mu           sync.Mutex
 	mcpManager   *mcpPkg.Manager
+	scanner      *scanner.Scanner
 	loopDetectors map[string]*loopdetect.Detector
 }
 
@@ -80,8 +82,15 @@ func New(cfg *config.Config) (*Bridge, error) {
 		rulesEngine:   rules.NewEngine(cfg.Rules),
 		apiClient:     api.NewClient(cfg),
 		done:          make(chan struct{}),
+		scanner:       scanner.New(),
 		loopDetectors: make(map[string]*loopdetect.Detector),
 	}
+
+	// Apply scanner config
+	if cfg.ScannerEnabled != nil {
+		b.scanner.SetEnabled(*cfg.ScannerEnabled)
+	}
+	b.scanner.LoadCustomRules(config.ConfigDir())
 
 	// Initialize S3 uploader if configured
 	if cfg.S3Config != nil {
@@ -199,6 +208,29 @@ func (b *Bridge) Start() error {
 		protocolName := "unknown"
 		if sess != nil {
 			protocolName = sess.GetProtocolName()
+		}
+
+		// Security scan output content
+		if contentStr, ok := msg.Content.(string); ok {
+			if alerts := b.scanner.Scan(contentStr); len(alerts) > 0 {
+				for _, a := range alerts {
+					b.sendMessage(Message{
+						Type: "security:alert",
+						Payload: map[string]interface{}{
+							"sessionId":   sessionID,
+							"deviceId":    b.config.DeviceID,
+							"category":    a.Category,
+							"level":       a.Level,
+							"ruleId":      a.RuleID,
+							"title":       a.Title,
+							"description": a.Description,
+							"match":       a.Match,
+						},
+						Timestamp: time.Now().UnixMilli(),
+					})
+				}
+				b.logInfo("[Scanner] %d alert(s) in session %s", len(alerts), sessionID)
+			}
 		}
 
 		switch msg.Type {
@@ -528,6 +560,10 @@ func (b *Bridge) handleMessage(msg Message) {
 		b.handleMultiAgentTaskAssign(msg)
 	case "acp:query_status":
 		b.handleACPQueryStatus(msg)
+	case "scanner:toggle":
+		b.handleScannerToggle(msg)
+	case "scanner:rules:sync":
+		b.handleScannerRulesSync(msg)
 	default:
 		b.logInfo("Unknown message type: %s", msg.Type)
 	}
@@ -630,6 +666,28 @@ func (b *Bridge) handleSessionSend(msg Message) {
 
 	sessionID, _ := payload["sessionId"].(string)
 	content, _ := payload["content"].(string)
+
+	// Scan input direction for security issues
+	if alerts := b.scanner.ScanWithDirection(content, scanner.DirInput); len(alerts) > 0 {
+		for _, a := range alerts {
+			b.sendMessage(Message{
+				Type: "security:alert",
+				Payload: map[string]interface{}{
+					"sessionId":   sessionID,
+					"deviceId":    b.config.DeviceID,
+					"category":    a.Category,
+					"level":       a.Level,
+					"ruleId":      a.RuleID,
+					"title":       a.Title,
+					"description": a.Description,
+					"match":       a.Match,
+					"direction":   "input",
+				},
+				Timestamp: time.Now().UnixMilli(),
+			})
+		}
+		b.logInfo("[Scanner] %d input alert(s) in session %s", len(alerts), sessionID)
+	}
 
 	sess := b.sessions.Get(sessionID)
 	if sess == nil {
@@ -932,6 +990,27 @@ func (b *Bridge) handleChatSend(msg Message) {
 
 	b.logInfo("Chat message for session %s: %s", sessionID, content)
 
+	// Scan input direction
+	if alerts := b.scanner.ScanWithDirection(content, scanner.DirInput); len(alerts) > 0 {
+		for _, a := range alerts {
+			b.sendMessage(Message{
+				Type: "security:alert",
+				Payload: map[string]interface{}{
+					"sessionId":   sessionID,
+					"deviceId":    b.config.DeviceID,
+					"category":    a.Category,
+					"level":       a.Level,
+					"ruleId":      a.RuleID,
+					"title":       a.Title,
+					"description": a.Description,
+					"match":       a.Match,
+					"direction":   "input",
+				},
+				Timestamp: time.Now().UnixMilli(),
+			})
+		}
+	}
+
 	sess := b.sessions.Get(sessionID)
 	if sess == nil {
 		var err error
@@ -1083,6 +1162,70 @@ func (b *Bridge) handlePromptsSync(msg Message) {
 		Payload: map[string]interface{}{
 			"deviceId": deviceId,
 			"success":  true,
+		},
+		Timestamp: time.Now().UnixMilli(),
+	})
+}
+
+// handleScannerToggle handles enabling/disabling the security scanner from web
+func (b *Bridge) handleScannerToggle(msg Message) {
+	payload, ok := msg.Payload.(map[string]interface{})
+	if !ok {
+		return
+	}
+	enabled, _ := payload["enabled"].(bool)
+	b.scanner.SetEnabled(enabled)
+	boolVal := enabled
+	b.config.ScannerEnabled = &boolVal
+	config.Save(b.config)
+	b.logInfo("[Scanner] Toggled to %v", enabled)
+
+	b.sendMessage(Message{
+		Type: "scanner:status",
+		Payload: map[string]interface{}{
+			"deviceId": b.config.DeviceID,
+			"enabled":  enabled,
+		},
+		Timestamp: time.Now().UnixMilli(),
+	})
+}
+
+// handleScannerRulesSync handles custom scanner rules pushed from web
+func (b *Bridge) handleScannerRulesSync(msg Message) {
+	payload, ok := msg.Payload.(map[string]interface{})
+	if !ok {
+		return
+	}
+	rulesData, ok := payload["rules"].([]interface{})
+	if !ok {
+		return
+	}
+
+	var defs []scanner.CustomRuleDef
+	for _, r := range rulesData {
+		if m, ok := r.(map[string]interface{}); ok {
+			defs = append(defs, scanner.CustomRuleDef{
+				ID:       getString(m, "id"),
+				Pattern:  getString(m, "pattern"),
+				Category: getString(m, "category"),
+				Level:    getString(m, "level"),
+				Title:    getString(m, "title"),
+				Desc:     getString(m, "desc"),
+			})
+		}
+	}
+
+	b.scanner.ReplaceCustomRules(defs)
+
+	// Persist to local file
+	config.SaveScannerRules(defs)
+	b.logInfo("[Scanner] Synced %d custom rules from web", len(defs))
+
+	b.sendMessage(Message{
+		Type: "scanner:rules:synced",
+		Payload: map[string]interface{}{
+			"deviceId": b.config.DeviceID,
+			"count":    len(defs),
 		},
 		Timestamp: time.Now().UnixMilli(),
 	})
