@@ -16,7 +16,9 @@ import (
 	"github.com/open-agents/bridge/internal/config"
 	"github.com/open-agents/bridge/internal/crypto"
 	"github.com/open-agents/bridge/internal/logger"
+	"github.com/open-agents/bridge/internal/loopdetect"
 	"github.com/open-agents/bridge/internal/metrics"
+	mcpPkg "github.com/open-agents/bridge/internal/mcp"
 	"github.com/open-agents/bridge/internal/permission"
 	"github.com/open-agents/bridge/internal/protocol"
 	"github.com/open-agents/bridge/internal/rules"
@@ -58,6 +60,8 @@ type Bridge struct {
 	webPubKey    *[crypto.KeySize]byte
 	done         chan struct{}
 	mu           sync.Mutex
+	mcpManager   *mcpPkg.Manager
+	loopDetectors map[string]*loopdetect.Detector
 }
 
 func New(cfg *config.Config) (*Bridge, error) {
@@ -68,20 +72,24 @@ func New(cfg *config.Config) (*Bridge, error) {
 	store, _ := storage.NewStore(storeDir)
 
 	b := &Bridge{
-		config:      cfg,
-		sessions:    session.NewManager(),
-		permHandler: handler,
-		permServer:  permission.NewServer(handler),
-		store:       store,
-		rulesEngine: rules.NewEngine(cfg.Rules),
-		apiClient:   api.NewClient(cfg),
-		done:        make(chan struct{}),
+		config:        cfg,
+		sessions:      session.NewManager(),
+		permHandler:   handler,
+		permServer:    permission.NewServer(handler),
+		store:         store,
+		rulesEngine:   rules.NewEngine(cfg.Rules),
+		apiClient:     api.NewClient(cfg),
+		done:          make(chan struct{}),
+		loopDetectors: make(map[string]*loopdetect.Detector),
 	}
 
 	// Initialize S3 uploader if configured
 	if cfg.S3Config != nil {
 		b.s3Uploader = storage.NewS3Uploader(cfg.S3Config)
 	}
+
+	// Initialize MCP manager
+	b.mcpManager = mcpPkg.NewManager(config.ConfigDir())
 
 	// Load E2EE keys if available
 	if cfg.PrivateKey != "" {
@@ -224,6 +232,24 @@ func (b *Bridge) Start() error {
 			// Record tool call metric
 			metrics.RecordToolCall(sessionID, fmt.Sprintf("%v", msg.Content))
 
+			// Loop detection
+			toolName := fmt.Sprintf("%v", msg.Content)
+			if _, ok := b.loopDetectors[sessionID]; !ok {
+				b.loopDetectors[sessionID] = loopdetect.New(30, 5, 10)
+			}
+			if result := b.loopDetectors[sessionID].Record(toolName, toolName); result.Level > loopdetect.None {
+				b.logDebug("Loop detection [%s]: %s", sessionID, result.Message)
+				b.sendMessage(Message{
+					Type: "session:output",
+					Payload: map[string]interface{}{
+						"sessionId":  sessionID,
+						"outputType": "stderr",
+						"content":    fmt.Sprintf("⚠ %s", result.Message),
+					},
+					Timestamp: time.Now().UnixMilli(),
+				})
+			}
+
 			// Tool invocation
 			b.sendMessage(Message{
 				Type: "tool:call",
@@ -312,6 +338,29 @@ func (b *Bridge) Start() error {
 		case protocol.MessageTypeError:
 			// Record error metric
 			metrics.RecordError(sessionID, "protocol")
+
+			// Try model fallback
+			if b.config.ModelFallbacks != nil {
+				if sess := b.sessions.Get(sessionID); sess != nil {
+					fallback := b.sessions.GetFallbackCLI(sess.CLIType, toFallbackConfigs(b.config.ModelFallbacks))
+					if fallback != "" {
+						b.logInfo("Attempting fallback from %s to %s for session %s", sess.CLIType, fallback, sessionID)
+						b.sendMessage(Message{
+							Type: "session:output",
+							Payload: map[string]interface{}{
+								"sessionId":  sessionID,
+								"deviceId":   b.config.DeviceID,
+								"outputType": "stderr",
+								"content":    fmt.Sprintf("[fallback] %s failed, switching to %s", sess.CLIType, fallback),
+							},
+							Timestamp: time.Now().UnixMilli(),
+						})
+						_ = b.sessions.Stop(sessionID)
+						_, _ = b.sessions.CreateWithIDAndSize(fallback, sess.WorkDir, sessionID+"-fb", 120, 30, sess.PermissionMode)
+						break
+					}
+				}
+			}
 
 			// Error message
 			b.sendMessage(Message{
@@ -463,6 +512,10 @@ func (b *Bridge) handleMessage(msg Message) {
 		b.handleDeviceRestart(msg)
 	case "prompts:sync":
 		b.handlePromptsSync(msg)
+	case "mcp:sync":
+		b.handleMCPSync(msg)
+	case "mcp:list":
+		b.handleMCPList(msg)
 	case "multiagent:start_job":
 		b.handleMultiAgentStartJob(msg)
 	case "multiagent:pause_job":
@@ -471,6 +524,8 @@ func (b *Bridge) handleMessage(msg Message) {
 		b.handleMultiAgentCancelJob(msg)
 	case "multiagent:start_task":
 		b.handleMultiAgentStartTask(msg)
+	case "multiagent:task_assign":
+		b.handleMultiAgentTaskAssign(msg)
 	case "acp:query_status":
 		b.handleACPQueryStatus(msg)
 	default:
@@ -1107,6 +1162,87 @@ func (b *Bridge) handleMultiAgentStartTask(msg Message) {
 	})
 }
 
+// handleMultiAgentTaskAssign handles task assignment from Orchestrator
+func (b *Bridge) handleMultiAgentTaskAssign(msg Message) {
+	payload, ok := msg.Payload.(map[string]interface{})
+	if !ok {
+		return
+	}
+
+	jobId := getString(payload, "jobId")
+	taskId := getString(payload, "taskId")
+	agent := getString(payload, "agent")
+	title := getString(payload, "title")
+	description := getString(payload, "description")
+	context := getString(payload, "context")
+
+	b.logInfo("Task assign: %s (agent: %s) in job %s", taskId, agent, jobId)
+
+	// Check process pool capacity
+	if b.sessions.ActiveCount() >= b.sessions.MaxConcurrent() {
+		b.logInfo("Process pool full, queuing task %s", taskId)
+		b.sessions.Enqueue(session.QueueItem{
+			CLIType:   agent,
+			WorkDir:   ".",
+			SessionID: taskId,
+			Cols:      120,
+			Rows:      30,
+			PermMode:  "accept-edits",
+			Prompt:    buildTaskPrompt(title, description, context),
+		})
+		return
+	}
+
+	b.startTaskSession(jobId, taskId, agent, title, description, context)
+}
+
+func (b *Bridge) startTaskSession(jobId, taskId, agent, title, description, context string) {
+	prompt := buildTaskPrompt(title, description, context)
+
+	sess, err := b.sessions.CreateWithIDAndSize(agent, ".", taskId, 120, 30, "accept-edits")
+	if err != nil {
+		b.logInfo("Failed to create session for task %s: %v", taskId, err)
+		b.sendMessage(Message{
+			Type: "multiagent:task_error",
+			Payload: map[string]interface{}{
+				"jobId":     jobId,
+				"taskId":    taskId,
+				"deviceId":  b.config.DeviceID,
+				"error":     err.Error(),
+				"errorType": "crash",
+			},
+			Timestamp: time.Now().UnixMilli(),
+		})
+		return
+	}
+
+	// Report progress
+	b.sendMessage(Message{
+		Type: "multiagent:task_progress",
+		Payload: map[string]interface{}{
+			"jobId":    jobId,
+			"taskId":   taskId,
+			"deviceId": b.config.DeviceID,
+			"progress": 0,
+			"step":     "started",
+		},
+		Timestamp: time.Now().UnixMilli(),
+	})
+
+	// Send the prompt to the CLI agent
+	if err := sess.Send(prompt); err != nil {
+		b.logInfo("Failed to send prompt for task %s: %v", taskId, err)
+	}
+}
+
+func buildTaskPrompt(title, description, context string) string {
+	prompt := title + "\n\n" + description
+	if context != "" {
+		prompt += "\n\n--- 上游任务输出 ---\n" + context
+	}
+	return prompt
+}
+
 // handleACPQueryStatus responds with current protocol status for all sessions
 func (b *Bridge) handleACPQueryStatus(msg Message) {
 	b.logInfo("[Bridge] Received ACP status query")
@@ -1148,4 +1284,94 @@ func (b *Bridge) handleACPQueryStatus(msg Message) {
 		},
 		Timestamp: time.Now().UnixMilli(),
 	})
+}
+
+// handleMCPSync syncs MCP server configurations from Web dashboard
+func (b *Bridge) handleMCPSync(msg Message) {
+	payload, ok := msg.Payload.(map[string]interface{})
+	if !ok {
+		return
+	}
+
+	if b.mcpManager == nil {
+		b.logInfo("MCP manager not initialized, skipping sync")
+		return
+	}
+
+	serversRaw, ok := payload["servers"]
+	if !ok {
+		return
+	}
+
+	// Convert to JSON and back to typed struct
+	data, err := json.Marshal(serversRaw)
+	if err != nil {
+		b.logError("Failed to marshal MCP servers: %v", err)
+		return
+	}
+
+	var servers map[string]struct {
+		Command string            `json:"command"`
+		Args    []string          `json:"args,omitempty"`
+		Env     map[string]string `json:"env,omitempty"`
+		Enabled bool              `json:"enabled"`
+	}
+	if err := json.Unmarshal(data, &servers); err != nil {
+		b.logError("Failed to unmarshal MCP servers: %v", err)
+		return
+	}
+
+	// Import into MCP manager
+	for name, s := range servers {
+		b.mcpManager.AddServer(name, mcpPkg.ServerConfig{
+			Command: s.Command,
+			Args:    s.Args,
+			Env:     s.Env,
+			Enabled: s.Enabled,
+		})
+	}
+
+	b.logInfo("MCP config synced: %d servers", len(servers))
+
+	b.sendMessage(Message{
+		Type: "mcp:synced",
+		Payload: map[string]interface{}{
+			"deviceId": b.config.DeviceID,
+			"count":    len(servers),
+		},
+		Timestamp: time.Now().UnixMilli(),
+	})
+}
+
+// handleMCPList responds with current MCP server configurations
+func (b *Bridge) handleMCPList(msg Message) {
+	if b.mcpManager == nil {
+		b.sendMessage(Message{
+			Type: "mcp:list_response",
+			Payload: map[string]interface{}{
+				"deviceId": b.config.DeviceID,
+				"servers":  map[string]interface{}{},
+			},
+			Timestamp: time.Now().UnixMilli(),
+		})
+		return
+	}
+
+	servers := b.mcpManager.ListServers()
+	b.sendMessage(Message{
+		Type: "mcp:list_response",
+		Payload: map[string]interface{}{
+			"deviceId": b.config.DeviceID,
+			"servers":  servers,
+		},
+		Timestamp: time.Now().UnixMilli(),
+	})
+}
+
+func toFallbackConfigs(mf []config.ModelFallback) []session.FallbackConfig {
+	out := make([]session.FallbackConfig, len(mf))
+	for i, f := range mf {
+		out[i] = session.FallbackConfig{CLIType: f.CLIType, Fallback: f.Fallback, OnError: f.OnError}
+	}
+	return out
 }

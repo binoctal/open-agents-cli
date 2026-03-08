@@ -38,6 +38,7 @@ func (h *HookServer) Start() error {
 	mux.HandleFunc("/hook/session-start", h.handleSessionStart)
 	mux.HandleFunc("/hook/tool-call", h.handleToolCall)
 	mux.HandleFunc("/hook/session-end", h.handleSessionEnd)
+	mux.HandleFunc("/hook/permission-request", h.handlePermissionRequest)
 	
 	// Health check
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
@@ -145,6 +146,29 @@ func (h *HookServer) handleSessionEnd(w http.ResponseWriter, r *http.Request) {
 		h.onEvent(event)
 	}
 	
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+}
+
+func (h *HookServer) handlePermissionRequest(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var event HookEvent
+	if err := json.NewDecoder(r.Body).Decode(&event); err != nil {
+		http.Error(w, "Invalid JSON", http.StatusBadRequest)
+		return
+	}
+
+	event.Type = "permission:request"
+	event.Timestamp = time.Now().UnixMilli()
+
+	if h.onEvent != nil {
+		h.onEvent(event)
+	}
+
 	w.WriteHeader(http.StatusOK)
 	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 }

@@ -15,27 +15,26 @@ var updateCmd = &cobra.Command{
 		fmt.Printf("Current version: %s\n", updater.Version)
 		fmt.Println("Checking for updates...")
 
-		release, hasUpdate, err := updater.CheckUpdate()
+		result, err := updater.CheckUpdate()
 		if err != nil {
 			fmt.Printf("Failed to check for updates: %v\n", err)
 			os.Exit(1)
 		}
 
-		if !hasUpdate {
+		if !result.HasUpdate {
 			fmt.Println("You are running the latest version.")
 			return
 		}
 
-		fmt.Printf("New version available: %s\n", release.TagName)
+		fmt.Printf("New version available: %s\n", result.LatestVersion)
 
-		downloadURL := updater.GetAssetForPlatform(release)
-		if downloadURL == "" {
+		if result.DownloadURL == "" {
 			fmt.Println("No binary available for your platform.")
 			os.Exit(1)
 		}
 
 		fmt.Println("Downloading update...")
-		tmpPath, err := updater.DownloadUpdate(downloadURL)
+		tmpPath, err := updater.DownloadUpdate(result.DownloadURL)
 		if err != nil {
 			fmt.Printf("Failed to download: %v\n", err)
 			os.Exit(1)

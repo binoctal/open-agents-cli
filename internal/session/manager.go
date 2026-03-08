@@ -15,6 +15,20 @@ type Manager struct {
 	sessions       map[string]*Session
 	mu             sync.RWMutex
 	outputCallback OutputCallback
+	maxConcurrent  int
+	queue          []QueueItem
+	queueMu        sync.Mutex
+}
+
+type QueueItem struct {
+	CLIType    string
+	WorkDir    string
+	SessionID  string
+	Cols       int
+	Rows       int
+	PermMode   string
+	Prompt     string
+	EnqueuedAt time.Time
 }
 
 type Session struct {
@@ -29,8 +43,48 @@ type Session struct {
 
 func NewManager() *Manager {
 	return &Manager{
-		sessions: make(map[string]*Session),
+		sessions:      make(map[string]*Session),
+		maxConcurrent: 3,
 	}
+}
+
+func (m *Manager) SetMaxConcurrent(n int) {
+	m.maxConcurrent = n
+}
+
+func (m *Manager) ActiveCount() int {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	count := 0
+	for _, s := range m.sessions {
+		if s.Status == "active" {
+			count++
+		}
+	}
+	return count
+}
+
+func (m *Manager) MaxConcurrent() int {
+	return m.maxConcurrent
+}
+
+func (m *Manager) Enqueue(item QueueItem) {
+	m.queueMu.Lock()
+	defer m.queueMu.Unlock()
+	item.EnqueuedAt = time.Now()
+	m.queue = append(m.queue, item)
+	log.Printf("[SessionManager] Enqueued session %s, queue size: %d", item.SessionID, len(m.queue))
+}
+
+func (m *Manager) DequeueNext() *QueueItem {
+	m.queueMu.Lock()
+	defer m.queueMu.Unlock()
+	if len(m.queue) == 0 {
+		return nil
+	}
+	item := m.queue[0]
+	m.queue = m.queue[1:]
+	return &item
 }
 
 func (m *Manager) SetOutputCallback(callback OutputCallback) {
@@ -293,4 +347,21 @@ func (s *Session) GetProtocolName() string {
 		return "none"
 	}
 	return s.Protocol.GetProtocolName()
+}
+
+// FallbackConfig holds model fallback chain configuration
+type FallbackConfig struct {
+	CLIType  string
+	Fallback string
+	OnError  string // "rate_limit", "timeout", "any"
+}
+
+// GetFallbackCLI returns the fallback CLI type for a given CLI, or empty string if none
+func (m *Manager) GetFallbackCLI(cliType string, fallbacks []FallbackConfig) string {
+	for _, f := range fallbacks {
+		if f.CLIType == cliType {
+			return f.Fallback
+		}
+	}
+	return ""
 }

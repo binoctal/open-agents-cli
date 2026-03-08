@@ -11,6 +11,9 @@ func NewClineAdapter() *ClineAdapter {
 			name:        "cline",
 			displayName: "Cline CLI",
 			command:     "cline",
+			extraEnv: []string{
+				"CLINE_PERMISSION_MODE=external",
+			},
 		},
 	}
 }
@@ -24,13 +27,19 @@ func (a *ClineAdapter) DisplayName() string {
 }
 
 func (a *ClineAdapter) Start(workDir string, args []string) error {
-	// Cline uses -s for settings
+	socketPath := getSocketPath()
+	if socketPath != "" {
+		a.extraEnv = append(a.extraEnv, "CLINE_HOOK_SOCKET="+socketPath)
+	}
 	cmdArgs := append([]string{"-s", "hooks_enabled=true"}, args...)
 	return a.BaseAdapter.Start(workDir, cmdArgs)
 }
 
 func (a *ClineAdapter) StartWithSize(workDir string, args []string, cols, rows int) error {
-	// Cline uses -s for settings
+	socketPath := getSocketPath()
+	if socketPath != "" {
+		a.extraEnv = append(a.extraEnv, "CLINE_HOOK_SOCKET="+socketPath)
+	}
 	cmdArgs := append([]string{"-s", "hooks_enabled=true"}, args...)
 	return a.BaseAdapter.StartWithSize(workDir, cmdArgs, cols, rows)
 }

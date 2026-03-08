@@ -33,6 +33,15 @@ type Config struct {
 
 	// v1.4: Synced prompts from Web
 	Prompts interface{} `json:"prompts,omitempty"`
+
+	// v2.2: Model fallback chain
+	ModelFallbacks []ModelFallback `json:"modelFallbacks,omitempty"`
+}
+
+type ModelFallback struct {
+	CLIType  string `json:"cliType"`            // which CLI this applies to
+	Fallback string `json:"fallback"`            // fallback CLI to use
+	OnError  string `json:"onError,omitempty"`   // "rate_limit", "timeout", "any" (default: "any")
 }
 
 type AutoApprovalRule struct {
