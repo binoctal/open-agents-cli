@@ -17,8 +17,8 @@ import (
 	"github.com/open-agents/bridge/internal/crypto"
 	"github.com/open-agents/bridge/internal/logger"
 	"github.com/open-agents/bridge/internal/loopdetect"
-	"github.com/open-agents/bridge/internal/metrics"
 	mcpPkg "github.com/open-agents/bridge/internal/mcp"
+	"github.com/open-agents/bridge/internal/metrics"
 	"github.com/open-agents/bridge/internal/permission"
 	"github.com/open-agents/bridge/internal/protocol"
 	"github.com/open-agents/bridge/internal/rules"
@@ -48,21 +48,21 @@ func (b *Bridge) logError(format string, args ...interface{}) {
 }
 
 type Bridge struct {
-	config       *config.Config
-	conn         *websocket.Conn
-	sessions     *session.Manager
-	permServer   *permission.Server
-	permHandler  *permission.Handler
-	store        *storage.Store
-	s3Uploader   *storage.S3Uploader
-	rulesEngine  *rules.Engine
-	apiClient    *api.Client
-	keyPair      *crypto.KeyPair
-	webPubKey    *[crypto.KeySize]byte
-	done         chan struct{}
-	mu           sync.Mutex
-	mcpManager   *mcpPkg.Manager
-	scanner      *scanner.Scanner
+	config        *config.Config
+	conn          *websocket.Conn
+	sessions      *session.Manager
+	permServer    *permission.Server
+	permHandler   *permission.Handler
+	store         *storage.Store
+	s3Uploader    *storage.S3Uploader
+	rulesEngine   *rules.Engine
+	apiClient     *api.Client
+	keyPair       *crypto.KeyPair
+	webPubKey     *[crypto.KeySize]byte
+	done          chan struct{}
+	mu            sync.Mutex
+	mcpManager    *mcpPkg.Manager
+	scanner       *scanner.Scanner
 	loopDetectors map[string]*loopdetect.Detector
 }
 
@@ -133,6 +133,11 @@ func New(cfg *config.Config) (*Bridge, error) {
 		return b.conn != nil
 	}))
 
+	// ✅ Start session cleanup worker
+	// Clean up inactive sessions every 5 minutes, remove sessions idle for >30 minutes
+	b.sessions.StartCleanupWorker(5*time.Minute, 30*time.Minute)
+	logger.Info("Session cleanup worker started (interval: 5m, max idle: 30m)")
+
 	return b, nil
 }
 
@@ -202,7 +207,7 @@ func (b *Bridge) Start() error {
 			}
 		}
 		b.logInfo("[Bridge] Forwarding: session=%s, type=%s, content=\"%s\"", sessionID, msg.Type, contentPreview)
-		
+
 		// Get session to check protocol
 		sess := b.sessions.Get(sessionID)
 		protocolName := "unknown"

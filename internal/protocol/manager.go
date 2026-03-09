@@ -137,3 +137,21 @@ func (m *Manager) GetProtocolName() string {
 	}
 	return m.adapter.Name()
 }
+
+// Reconnect attempts to reconnect a disconnected session
+func (m *Manager) Reconnect(config AdapterConfig) error {
+	if m.IsConnected() {
+		log.Printf("[Protocol] Already connected, skipping reconnect")
+		return nil
+	}
+
+	log.Printf("[Protocol] Attempting to reconnect...")
+
+	// Disconnect old adapter if exists
+	if m.adapter != nil {
+		m.Disconnect()
+	}
+
+	// Reconnect using same detection logic
+	return m.Connect(config)
+}

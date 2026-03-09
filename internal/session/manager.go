@@ -36,9 +36,11 @@ type Session struct {
 	CLIType        string
 	WorkDir        string
 	PermissionMode string // "default", "plan", "accept-edits", "accept-all"
-	Status         string // "active", "completed", "error"
+	Status         string // "active", "completed", "error", "replaced"
 	Protocol       *protocol.Manager
 	CreatedAt      time.Time
+	LastActiveAt   time.Time              // Track last activity
+	Config         protocol.AdapterConfig // Store config for reconnection
 }
 
 func NewManager() *Manager {
@@ -113,6 +115,62 @@ func (m *Manager) CreateWithIDAndSize(cliType, workDir, sessionID string, cols, 
 		permissionMode = "default"
 	}
 
+	// ✅ Check if session with same ID already exists
+	if existingSess, exists := m.sessions[sessionID]; exists {
+		log.Printf("[SessionManager] 🔍 Session %s already exists, attempting recovery...", sessionID)
+		log.Printf("[SessionManager]   └─ Existing: cliType=%s, workDir=%s, status=%s, created=%v",
+			existingSess.CLIType, existingSess.WorkDir, existingSess.Status, existingSess.CreatedAt)
+		log.Printf("[SessionManager]   └─ New request: cliType=%s, workDir=%s, permMode=%s",
+			cliType, workDir, permissionMode)
+
+		// P1: Try to resume existing session
+		if m.canResumeSession(existingSess, cliType, workDir) {
+			log.Printf("[SessionManager] ✅ RESUMING existing session %s", sessionID)
+			log.Printf("[SessionManager]   └─ Protocol: %s (still connected)", existingSess.Protocol.GetProtocolName())
+			log.Printf("[SessionManager]   └─ Status: %s", existingSess.Status)
+			log.Printf("[SessionManager]   └─ History preserved!")
+
+			// Update session parameters if needed
+			existingSess.PermissionMode = permissionMode
+			existingSess.LastActiveAt = time.Now()
+
+			// Return existing session
+			return existingSess, nil
+		}
+
+		// P2: Try to reconnect if protocol is disconnected but session is otherwise valid
+		if existingSess.Status == "active" && existingSess.Protocol != nil && !existingSess.Protocol.IsConnected() {
+			log.Printf("[SessionManager] 🔄 Attempting to reconnect session %s", sessionID)
+
+			// Try to reconnect using stored config
+			if err := existingSess.Protocol.Reconnect(existingSess.Config); err == nil {
+				log.Printf("[SessionManager] ✅ Successfully reconnected session %s", sessionID)
+				existingSess.LastActiveAt = time.Now()
+				return existingSess, nil
+			}
+
+			log.Printf("[SessionManager] ⚠️  Reconnection failed for session %s", sessionID)
+		}
+
+		// Cannot resume or reconnect - need to replace
+		log.Printf("[SessionManager] ⚠️  Cannot resume session %s, replacing it", sessionID)
+		log.Printf("[SessionManager]   └─ Reason: Protocol disconnected or incompatible parameters")
+
+		// Clean up existing session
+		if existingSess.Protocol != nil {
+			log.Printf("[SessionManager]   └─ Disconnecting old protocol connection")
+			existingSess.Protocol.Disconnect()
+		}
+		existingSess.Status = "replaced"
+
+		// Remove from active sessions
+		delete(m.sessions, sessionID)
+		log.Printf("[SessionManager]   └─ ✅ Old session cleaned up and removed")
+	} else {
+		log.Printf("[SessionManager] 🆕 Creating new session: ID=%s, cliType=%s, workDir=%s",
+			sessionID, cliType, workDir)
+	}
+
 	// Create protocol manager
 	protocolMgr := protocol.NewManager()
 
@@ -163,10 +221,150 @@ func (m *Manager) CreateWithIDAndSize(cliType, workDir, sessionID string, cols, 
 		return nil, err
 	}
 
+	// ✅ Store config for future reconnection attempts
+	sess.Config = config
+	sess.LastActiveAt = time.Now()
+
 	log.Printf("[SessionManager] Session %s connected using protocol: %s", sessionID, protocolMgr.GetProtocolName())
+	log.Printf("[SessionManager]   └─ Config stored for reconnection capability")
 
 	m.sessions[sess.ID] = sess
+	log.Printf("[SessionManager] ✅ Session created successfully")
+	log.Printf("[SessionManager]   └─ ID: %s", sessionID)
+	log.Printf("[SessionManager]   └─ CLI Type: %s", cliType)
+	log.Printf("[SessionManager]   └─ Protocol: %s", protocolMgr.GetProtocolName())
+	log.Printf("[SessionManager]   └─ Total sessions: %d (active: %d)", len(m.sessions), m.activeCountLocked())
 	return sess, nil
+}
+
+// activeCountLocked returns active session count (must be called with lock held)
+func (m *Manager) activeCountLocked() int {
+	count := 0
+	for _, s := range m.sessions {
+		if s.Status == "active" {
+			count++
+		}
+	}
+	return count
+}
+
+// canResumeSession checks if an existing session can be resumed
+func (m *Manager) canResumeSession(sess *Session, cliType, workDir string) bool {
+	// Check if session is active
+	if sess.Status != "active" {
+		log.Printf("[SessionManager]   └─ Cannot resume: status is %s (not active)", sess.Status)
+		return false
+	}
+
+	// Check if CLI type matches
+	if sess.CLIType != cliType {
+		log.Printf("[SessionManager]   └─ Cannot resume: CLI type mismatch (existing: %s, requested: %s)", sess.CLIType, cliType)
+		return false
+	}
+
+	// Check if working directory matches
+	if sess.WorkDir != workDir {
+		log.Printf("[SessionManager]   └─ Cannot resume: workDir mismatch (existing: %s, requested: %s)", sess.WorkDir, workDir)
+		return false
+	}
+
+	// Check if protocol exists and is connected
+	if sess.Protocol == nil {
+		log.Printf("[SessionManager]   └─ Cannot resume: protocol is nil")
+		return false
+	}
+
+	if !sess.Protocol.IsConnected() {
+		log.Printf("[SessionManager]   └─ Cannot resume: protocol is disconnected")
+		return false
+	}
+
+	// All checks passed - can resume
+	log.Printf("[SessionManager]   └─ ✅ Can resume: all checks passed")
+	return true
+}
+
+// StartCleanupWorker starts a background worker to clean up inactive sessions
+func (m *Manager) StartCleanupWorker(interval time.Duration, maxIdleTime time.Duration) {
+	log.Printf("[SessionManager] Starting cleanup worker (interval: %v, maxIdleTime: %v)", interval, maxIdleTime)
+	ticker := time.NewTicker(interval)
+	go func() {
+		for range ticker.C {
+			m.cleanupIdleSessions(maxIdleTime)
+		}
+	}()
+}
+
+// cleanupIdleSessions removes inactive sessions that have been idle for too long
+func (m *Manager) cleanupIdleSessions(maxIdleTime time.Duration) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	now := time.Now()
+	cleaned := 0
+	checked := 0
+
+	log.Printf("[SessionManager] 🧹 Starting cleanup cycle (maxIdleTime: %v)", maxIdleTime)
+	log.Printf("[SessionManager]   └─ Current sessions: %d", len(m.sessions))
+
+	for id, sess := range m.sessions {
+		checked++
+		// Only clean up non-active sessions
+		if sess.Status != "active" {
+			idleTime := now.Sub(sess.CreatedAt)
+			log.Printf("[SessionManager]   └─ Checking inactive session: %s (status: %s, idle: %v)",
+				id, sess.Status, idleTime)
+
+			if idleTime > maxIdleTime {
+				// Disconnect protocol if still connected
+				if sess.Protocol != nil {
+					log.Printf("[SessionManager]     └─ Disconnecting protocol")
+					sess.Protocol.Disconnect()
+				}
+				delete(m.sessions, id)
+				cleaned++
+				log.Printf("[SessionManager]     └─ ✅ Cleaned up (idle for %v)", idleTime)
+			} else {
+				log.Printf("[SessionManager]     └─ ⏳ Kept (still within threshold)")
+			}
+		}
+	}
+
+	if cleaned > 0 {
+		log.Printf("[SessionManager] 🧹 Cleanup complete: checked=%d, removed=%d, remaining=%d (active: %d)",
+			checked, cleaned, len(m.sessions), m.activeCountLocked())
+	} else {
+		log.Printf("[SessionManager] 🧹 Cleanup complete: no sessions to clean (checked %d sessions)", checked)
+	}
+}
+
+// GetStats returns session statistics
+func (m *Manager) GetStats() map[string]int {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	stats := map[string]int{
+		"total":     len(m.sessions),
+		"active":    0,
+		"completed": 0,
+		"error":     0,
+		"replaced":  0,
+	}
+
+	for _, sess := range m.sessions {
+		switch sess.Status {
+		case "active":
+			stats["active"]++
+		case "completed":
+			stats["completed"]++
+		case "error":
+			stats["error"]++
+		case "replaced":
+			stats["replaced"]++
+		}
+	}
+
+	return stats
 }
 
 // applyPermissionMode configures the adapter based on permission mode
