@@ -389,6 +389,9 @@ func (m *Manager) applyPermissionMode(permissionMode, cliType string, config *pr
 			config.CustomEnv["GOOSE_MODE"] = "auto"
 		case "gemini":
 			config.CustomEnv["GEMINI_PERMISSION_MODE"] = "accept-all"
+		case "aider":
+			// Aider uses --yes for auto-accept
+			config.Args = append(config.Args, "--yes")
 		}
 
 	case "accept-edits":
@@ -402,6 +405,10 @@ func (m *Manager) applyPermissionMode(permissionMode, cliType string, config *pr
 			config.CustomEnv["GOOSE_MODE"] = "auto-edit"
 		case "gemini":
 			config.CustomEnv["GEMINI_PERMISSION_MODE"] = "accept-edits"
+		case "aider":
+			// Aider doesn't distinguish between edits and commands
+			// Use --yes for auto-accept in edit mode too
+			config.Args = append(config.Args, "--yes")
 		}
 
 	case "plan":
@@ -442,6 +449,11 @@ func (m *Manager) getCLICommand(cliType string) (string, []string) {
 		return "cline", nil
 	case "codex":
 		return "codex", nil
+	case "aider":
+		// Aider - AI pair programming in terminal (PTY mode)
+		// Installation: pip install aider-chat
+		// Uses its own protocol, not ACP
+		return "aider", []string{"--no-auto-commits", "--pretty"}
 	default:
 		return cliType, nil
 	}
