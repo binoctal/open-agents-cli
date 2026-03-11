@@ -48,22 +48,23 @@ func (b *Bridge) logError(format string, args ...interface{}) {
 }
 
 type Bridge struct {
-	config        *config.Config
-	conn          *websocket.Conn
-	sessions      *session.Manager
-	permServer    *permission.Server
-	permHandler   *permission.Handler
-	store         *storage.Store
-	s3Uploader    *storage.S3Uploader
-	rulesEngine   *rules.Engine
-	apiClient     *api.Client
-	keyPair       *crypto.KeyPair
-	webPubKey     *[crypto.KeySize]byte
-	done          chan struct{}
-	mu            sync.Mutex
-	mcpManager    *mcpPkg.Manager
-	scanner       *scanner.Scanner
-	loopDetectors map[string]*loopdetect.Detector
+	config          *config.Config
+	conn            *websocket.Conn
+	sessions        *session.Manager
+	permServer      *permission.Server
+	permHandler     *permission.Handler
+	store           *storage.Store
+	s3Uploader       *storage.S3Uploader
+	rulesEngine     *rules.Engine
+	apiClient       *api.Client
+	keyPair         *crypto.KeyPair
+	webPubKey       *[crypto.KeySize]byte
+	done            chan struct{}
+	mu              sync.Mutex
+	mcpManager      *mcpPkg.Manager
+	scanner         *scanner.Scanner
+	loopDetectors   map[string]*loopdetect.Detector
+	callbackManager *multiagent.CallbackManager
 }
 
 func New(cfg *config.Config) (*Bridge, error) {

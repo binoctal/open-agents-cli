@@ -11,10 +11,14 @@ import (
 
 type OutputCallback func(sessionID string, msg protocol.Message)
 
+// ExitCallback is called when a session exits
+type ExitCallback func(sessionID string, exitCode int, output []byte)
+
 type Manager struct {
 	sessions       map[string]*Session
 	mu             sync.RWMutex
 	outputCallback OutputCallback
+	exitCallback   ExitCallback
 	maxConcurrent  int
 	queue          []QueueItem
 	queueMu        sync.Mutex
@@ -41,6 +45,13 @@ type Session struct {
 	CreatedAt      time.Time
 	LastActiveAt   time.Time              // Track last activity
 	Config         protocol.AdapterConfig // Store config for reconnection
+
+	// Multi-agent task metadata
+	JobID     string    // Associated multi-agent job ID (if any)
+	TaskID    string    // Associated multi-agent task ID (if any)
+	StartedAt time.Time // Task start time for duration tracking
+	Output    []byte    // Collected CLI output for artifacts extraction
+	ExitCode  int       // Process exit code (set when session exits)
 }
 
 func NewManager() *Manager {
@@ -91,6 +102,10 @@ func (m *Manager) DequeueNext() *QueueItem {
 
 func (m *Manager) SetOutputCallback(callback OutputCallback) {
 	m.outputCallback = callback
+}
+
+func (m *Manager) SetExitCallback(callback ExitCallback) {
+	m.exitCallback = callback
 }
 
 func (m *Manager) Create(cliType, workDir string) (*Session, error) {
@@ -184,16 +199,21 @@ func (m *Manager) CreateWithIDAndSize(cliType, workDir, sessionID string, cols, 
 		CreatedAt:      time.Now(),
 	}
 
-	// Set up message callback
-	if m.outputCallback != nil {
-		log.Printf("[SessionManager] Setting up message callback for session %s", sessionID)
-		protocolMgr.Subscribe(func(msg protocol.Message) {
-			log.Printf("[SessionManager] Message received: type=%s", msg.Type)
+	// Set up message callback with output collection
+	log.Printf("[SessionManager] Setting up message callback for session %s", sessionID)
+	protocolMgr.Subscribe(func(msg protocol.Message) {
+		log.Printf("[SessionManager] Message received: type=%s", msg.Type)
+
+		// Collect output for multi-agent tasks
+		if sess.JobID != "" && msg.Type == protocol.MessageTypeContent {
+				sess.Output = append(sess.Output, []byte(msg.Content)...)
+		}
+
+		// Forward to output callback
+		if m.outputCallback != nil {
 			m.outputCallback(sess.ID, msg)
-		})
-	} else {
-		log.Printf("[SessionManager] WARNING: No output callback set for session %s", sessionID)
-	}
+		}
+	})
 
 	// Get CLI command and args
 	command, args := m.getCLICommand(cliType)
@@ -489,6 +509,11 @@ func (m *Manager) List() []*Session {
 }
 
 func (m *Manager) Stop(id string) error {
+	return m.StopWithExitCode(id, 0)
+}
+
+// StopWithExitCode stops a session and reports the exit code
+func (m *Manager) StopWithExitCode(id string, exitCode int) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -497,12 +522,31 @@ func (m *Manager) Stop(id string) error {
 		return nil
 	}
 
+	// Get output before disconnecting
+	output := sess.Output
+
 	if sess.Protocol != nil {
 		sess.Protocol.Disconnect()
 	}
 
-	sess.Status = "completed"
+	// Determine final status based on exit code
+	if exitCode == 0 {
+		sess.Status = "completed"
+	} else {
+		sess.Status = "error"
+	}
+
+	// Store session info before deletion for callback
+	jobID := sess.JobID
+	taskID := sess.TaskID
+
 	delete(m.sessions, id)
+
+	// Call exit callback if set and this is a multi-agent task
+	if m.exitCallback != nil && jobID != "" && taskID != "" {
+		go m.exitCallback(id, exitCode, output)
+	}
+
 	return nil
 }
 
@@ -532,6 +576,18 @@ func (s *Session) Send(input string) error {
 		log.Printf("[Session.Send] SendMessage error: %v", err)
 	}
 	return err
+}
+
+// SetMultiAgentMetadata sets the multi-agent task metadata for a session
+func (s *Session) SetMultiAgentMetadata(jobID, taskID string) {
+	s.JobID = jobID
+	s.TaskID = taskID
+	s.StartedAt = time.Now()
+}
+
+// GetMultiAgentMetadata returns the multi-agent task metadata
+func (s *Session) GetMultiAgentMetadata() (jobID, taskID string, startedAt time.Time) {
+	return s.JobID, s.TaskID, s.StartedAt
 }
 
 func (s *Session) Resize(cols, rows int) error {
