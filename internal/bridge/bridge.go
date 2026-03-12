@@ -478,46 +478,61 @@ func (b *Bridge) connect() error {
 	u.RawQuery = q.Encode()
 	u.Path = fmt.Sprintf("/ws/%s", b.config.UserID)
 
-	b.logInfo("Connecting to %s", u.String())
+	b.logInfo("[Bridge] 🔌 Connecting to %s", u.String())
 
 	conn, _, err := websocket.DefaultDialer.Dial(u.String(), nil)
 	if err != nil {
-		// For demo, continue without connection
-		b.logInfo("Warning: Could not connect to server: %v", err)
-		b.logInfo("Running in offline mode...")
-		return nil
+		b.logInfo("[Bridge] ❌ Could not connect to server: %v", err)
+		return err
 	}
 
 	b.conn = conn
-	b.logInfo("Connected to server")
+	b.logInfo("[Bridge] ✅ Connected to server successfully")
 	return nil
 }
 
 func (b *Bridge) readLoop() {
-	if b.conn == nil {
-		return
-	}
-
 	for {
 		select {
 		case <-b.done:
 			return
 		default:
-			_, data, err := b.conn.ReadMessage()
-			if err != nil {
-				b.logInfo("WebSocket read error: %v", err)
-				b.reconnect()
-				continue
-			}
-
-			var msg Message
-			if err := json.Unmarshal(data, &msg); err != nil {
-				b.logInfo("Failed to parse message: %v", err)
-				continue
-			}
-
-			b.handleMessage(msg)
 		}
+
+		// If not connected, try to connect
+		if b.conn == nil {
+			b.logInfo("[Bridge] ⚠️  Not connected, attempting to connect...")
+			if err := b.connect(); err != nil {
+				b.logInfo("[Bridge] ❌ Connection failed: %v, retrying in 5s...", err)
+				time.Sleep(5 * time.Second)
+				continue
+			}
+			// Send device:online after successful connection
+			b.sendMessage(Message{
+				Type: "device:online",
+				Payload: map[string]string{
+					"deviceId":   b.config.DeviceID,
+					"deviceName": getDeviceName(),
+				},
+				Timestamp: time.Now().UnixMilli(),
+			})
+			b.logInfo("[Bridge] 📨 Sent device:online message")
+		}
+
+		_, data, err := b.conn.ReadMessage()
+		if err != nil {
+			b.logInfo("[Bridge] ❌ WebSocket read error: %v", err)
+			b.reconnect()
+			continue
+		}
+
+		var msg Message
+		if err := json.Unmarshal(data, &msg); err != nil {
+			b.logInfo("[Bridge] Failed to parse message: %v", err)
+			continue
+		}
+
+		b.handleMessage(msg)
 	}
 }
 
