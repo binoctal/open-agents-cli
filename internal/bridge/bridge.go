@@ -1085,11 +1085,31 @@ func (b *Bridge) heartbeat() {
 }
 
 func (b *Bridge) reconnect() {
-	b.logInfo("Reconnecting...")
+	b.logInfo("[Bridge] 🔄 Reconnecting...")
+	b.logInfo("[Bridge]   └─ Current connection state: conn=%v", b.conn != nil)
 	alert.WebSocketDisconnected("connection lost")
 	time.Sleep(5 * time.Second)
-	if err := b.connect(); err == nil && b.conn != nil {
+
+	b.logInfo("[Bridge]   └─ Attempting to connect...")
+	err := b.connect()
+	b.logInfo("[Bridge]   └─ connect() returned: err=%v, conn=%v", err, b.conn != nil)
+
+	if err == nil && b.conn != nil {
+		b.logInfo("[Bridge]   └─ ✅ Reconnection successful!")
 		alert.WebSocketReconnected()
+
+		// Re-send device:online message after successful reconnection
+		b.sendMessage(Message{
+			Type: "device:online",
+			Payload: map[string]string{
+				"deviceId":   b.config.DeviceID,
+				"deviceName": getDeviceName(),
+			},
+			Timestamp: time.Now().UnixMilli(),
+		})
+		b.logInfo("[Bridge]   └─ 📨 Re-sent device:online message")
+	} else {
+		b.logInfo("[Bridge]   └─ ❌ Reconnection failed, will retry in readLoop")
 	}
 }
 
