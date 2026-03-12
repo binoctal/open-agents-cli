@@ -19,6 +19,7 @@ import (
 	"github.com/open-agents/bridge/internal/loopdetect"
 	mcpPkg "github.com/open-agents/bridge/internal/mcp"
 	"github.com/open-agents/bridge/internal/metrics"
+	"github.com/open-agents/bridge/internal/multiagent"
 	"github.com/open-agents/bridge/internal/permission"
 	"github.com/open-agents/bridge/internal/protocol"
 	"github.com/open-agents/bridge/internal/rules"

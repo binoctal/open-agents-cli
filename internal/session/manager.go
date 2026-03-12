@@ -204,9 +204,11 @@ func (m *Manager) CreateWithIDAndSize(cliType, workDir, sessionID string, cols, 
 	protocolMgr.Subscribe(func(msg protocol.Message) {
 		log.Printf("[SessionManager] Message received: type=%s", msg.Type)
 
-		// Collect output for multi-agent tasks
+			// Collect output for multi-agent tasks
 		if sess.JobID != "" && msg.Type == protocol.MessageTypeContent {
-				sess.Output = append(sess.Output, []byte(msg.Content)...)
+			if content, ok := msg.Content.(string); ok {
+				sess.Output = append(sess.Output, []byte(content)...)
+			}
 		}
 
 		// Forward to output callback
