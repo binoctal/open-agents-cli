@@ -1,9 +1,13 @@
-.PHONY: build clean install test
+.PHONY: all build clean install test
 
 BINARY_NAME=open-agents
 BUILD_DIR=build
 
-# Build for current platform
+# Default build - build for current platform to build directory
+all:
+	go build -o $(BUILD_DIR)/$(BINARY_NAME) ./cmd/open-agents
+
+# Build for current platform (legacy - outputs to root dir)
 build:
 	go build -o $(BUILD_DIR)/$(BINARY_NAME) ./cmd/open-agents
 
