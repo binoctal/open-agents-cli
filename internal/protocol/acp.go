@@ -19,28 +19,28 @@ import (
 
 // terminalState stores the state of a terminal command
 type terminalState struct {
-	output     string
-	exitCode   int
-	signal     string
-	truncated  bool
-	done       bool
-	doneChan   chan struct{}
+	output    string
+	exitCode  int
+	signal    string
+	truncated bool
+	done      bool
+	doneChan  chan struct{}
 }
 
 // ACPAdapter implements the Agent Client Protocol (ACP)
 type ACPAdapter struct {
-	cmd         *exec.Cmd
-	stdin       io.WriteCloser
-	stdout      io.ReadCloser
-	stderr      io.ReadCloser
-	connected   atomic.Bool
-	callback    func(Message)
-	requestID   atomic.Int64
-	mu          sync.Mutex
-	sessionID   string
-	workDir     string
-	terminals   map[string]*terminalState // terminalId -> state
-	terminalMu  sync.RWMutex
+	cmd        *exec.Cmd
+	stdin      io.WriteCloser
+	stdout     io.ReadCloser
+	stderr     io.ReadCloser
+	connected  atomic.Bool
+	callback   func(Message)
+	requestID  atomic.Int64
+	mu         sync.Mutex
+	sessionID  string
+	workDir    string
+	terminals  map[string]*terminalState // terminalId -> state
+	terminalMu sync.RWMutex
 	// Token usage tracking (estimated)
 	inputTokens  atomic.Int64
 	outputTokens atomic.Int64
@@ -125,6 +125,9 @@ func (a *ACPAdapter) Connect(config AdapterConfig) error {
 	go a.readMessages()
 	go a.readErrors()
 
+	// Monitor process exit
+	go a.monitorProcess()
+
 	// Send initialize request
 	if err := a.initialize(); err != nil {
 		a.Disconnect()
@@ -156,7 +159,21 @@ func (a *ACPAdapter) Disconnect() error {
 }
 
 func (a *ACPAdapter) IsConnected() bool {
-	return a.connected.Load()
+	if !a.connected.Load() {
+		return false
+	}
+
+	// Check if process is still running
+	if a.cmd != nil && a.cmd.Process != nil {
+		// Check if process has exited
+		if a.cmd.ProcessState != nil && a.cmd.ProcessState.Exited() {
+			log.Printf("[ACP] Process has exited, marking as disconnected")
+			a.connected.Store(false)
+			return false
+		}
+	}
+
+	return true
 }
 
 func (a *ACPAdapter) SendMessage(msg Message) error {
@@ -317,6 +334,25 @@ func (a *ACPAdapter) initialize() error {
 	}
 
 	return a.sendJSONRPC(sessionReq)
+}
+
+// monitorProcess watches for process exit and updates connection status
+func (a *ACPAdapter) monitorProcess() {
+	if a.cmd == nil || a.cmd.Process == nil {
+		return
+	}
+
+	// Wait for process to exit
+	err := a.cmd.Wait()
+
+	// Mark as disconnected
+	a.connected.Store(false)
+
+	if err != nil {
+		log.Printf("[ACP] Process exited with error: %v", err)
+	} else {
+		log.Printf("[ACP] Process exited normally")
+	}
 }
 
 // readMessages reads JSON-RPC messages from stdout

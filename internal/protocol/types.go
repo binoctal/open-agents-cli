@@ -4,15 +4,17 @@ package protocol
 type MessageType string
 
 const (
-	MessageTypeContent    MessageType = "content"     // AI response text
-	MessageTypeThought    MessageType = "thought"     // AI thinking process
-	MessageTypeToolCall   MessageType = "tool_call"   // Tool invocation
-	MessageTypePermission MessageType = "permission"  // Permission request
-	MessageTypeStatus     MessageType = "status"      // Agent status change
-	MessageTypePlan       MessageType = "plan"        // Task plan
-	MessageTypeError      MessageType = "error"       // Error message
-	MessageTypeCancel     MessageType = "cancel"      // Cancel/interrupt operation
-	MessageTypeUsage      MessageType = "usage"       // Token usage statistics
+	MessageTypeContent    MessageType = "content"    // AI response text
+	MessageTypeThought    MessageType = "thought"    // AI thinking process
+	MessageTypeToolCall   MessageType = "tool_call"  // Tool invocation
+	MessageTypePermission MessageType = "permission" // Permission request
+	MessageTypeStatus     MessageType = "status"     // Agent status change
+	MessageTypePlan       MessageType = "plan"       // Task plan
+	MessageTypeError      MessageType = "error"      // Error message
+	MessageTypeCancel     MessageType = "cancel"     // Cancel/interrupt operation
+	MessageTypeUsage      MessageType = "usage"      // Token usage statistics
+	MessageTypePing       MessageType = "ping"       // Ping message for connection verification
+	MessageTypePong       MessageType = "pong"       // Pong response to ping
 )
 
 // AgentStatus represents the current state of the agent
@@ -35,7 +37,7 @@ type Message struct {
 
 // PermissionRequest represents a permission request
 type PermissionRequest struct {
-	ID          interface{}            `json:"id"`          // Can be string or number (JSON-RPC 2.0)
+	ID          interface{}            `json:"id"` // Can be string or number (JSON-RPC 2.0)
 	ToolName    string                 `json:"tool_name"`
 	ToolInput   map[string]interface{} `json:"tool_input"`
 	Description string                 `json:"description"`
@@ -45,7 +47,7 @@ type PermissionRequest struct {
 
 // PermissionResponse represents the user's response
 type PermissionResponse struct {
-	ID       interface{} `json:"id"`       // Can be string or number (JSON-RPC 2.0 requires same type as request)
+	ID       interface{} `json:"id"`        // Can be string or number (JSON-RPC 2.0 requires same type as request)
 	OptionID string      `json:"option_id"` // "allow_once", "allow_always", "reject_once", "reject_always"
 }
 
@@ -60,9 +62,9 @@ type ToolCall struct {
 
 // UsageStats represents token usage statistics
 type UsageStats struct {
-	InputTokens    int `json:"inputTokens"`
-	OutputTokens   int `json:"outputTokens"`
-	CacheCreation  int `json:"cacheCreation"`
-	CacheRead      int `json:"cacheRead"`
-	ContextSize    int `json:"contextSize"`
+	InputTokens   int `json:"inputTokens"`
+	OutputTokens  int `json:"outputTokens"`
+	CacheCreation int `json:"cacheCreation"`
+	CacheRead     int `json:"cacheRead"`
+	ContextSize   int `json:"contextSize"`
 }

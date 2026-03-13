@@ -22,6 +22,7 @@ import (
 	"github.com/open-agents/bridge/internal/multiagent"
 	"github.com/open-agents/bridge/internal/permission"
 	"github.com/open-agents/bridge/internal/protocol"
+	"github.com/open-agents/bridge/internal/reconnect"
 	"github.com/open-agents/bridge/internal/rules"
 	"github.com/open-agents/bridge/internal/scanner"
 	"github.com/open-agents/bridge/internal/session"
@@ -49,23 +50,27 @@ func (b *Bridge) logError(format string, args ...interface{}) {
 }
 
 type Bridge struct {
-	config          *config.Config
-	conn            *websocket.Conn
-	sessions        *session.Manager
-	permServer      *permission.Server
-	permHandler     *permission.Handler
-	store           *storage.Store
-	s3Uploader       *storage.S3Uploader
-	rulesEngine     *rules.Engine
-	apiClient       *api.Client
-	keyPair         *crypto.KeyPair
-	webPubKey       *[crypto.KeySize]byte
-	done            chan struct{}
-	mu              sync.Mutex
-	mcpManager      *mcpPkg.Manager
-	scanner         *scanner.Scanner
-	loopDetectors   map[string]*loopdetect.Detector
-	callbackManager *multiagent.CallbackManager
+	config            *config.Config
+	conn              *websocket.Conn
+	sessions          *session.Manager
+	permServer        *permission.Server
+	permHandler       *permission.Handler
+	store             *storage.Store
+	s3Uploader        *storage.S3Uploader
+	rulesEngine       *rules.Engine
+	apiClient         *api.Client
+	keyPair           *crypto.KeyPair
+	webPubKey         *[crypto.KeySize]byte
+	done              chan struct{}
+	mu                sync.Mutex
+	mcpManager        *mcpPkg.Manager
+	scanner           *scanner.Scanner
+	loopDetectors     map[string]*loopdetect.Detector
+	callbackManager   *multiagent.CallbackManager
+	reconnectStrategy *reconnect.Strategy
+	stateManager      *StateManager
+	reconnectCallback *reconnect.CallbackManager
+	reconnectMetrics  *reconnect.Metrics
 }
 
 func New(cfg *config.Config) (*Bridge, error) {
@@ -76,16 +81,20 @@ func New(cfg *config.Config) (*Bridge, error) {
 	store, _ := storage.NewStore(storeDir)
 
 	b := &Bridge{
-		config:        cfg,
-		sessions:      session.NewManager(),
-		permHandler:   handler,
-		permServer:    permission.NewServer(handler),
-		store:         store,
-		rulesEngine:   rules.NewEngine(cfg.Rules),
-		apiClient:     api.NewClient(cfg),
-		done:          make(chan struct{}),
-		scanner:       scanner.New(),
-		loopDetectors: make(map[string]*loopdetect.Detector),
+		config:            cfg,
+		sessions:          session.NewManager(),
+		permHandler:       handler,
+		permServer:        permission.NewServer(handler),
+		store:             store,
+		rulesEngine:       rules.NewEngine(cfg.Rules),
+		apiClient:         api.NewClient(cfg),
+		done:              make(chan struct{}),
+		scanner:           scanner.New(),
+		loopDetectors:     make(map[string]*loopdetect.Detector),
+		reconnectStrategy: reconnect.NewStrategy(),
+		stateManager:      NewStateManager(),
+		reconnectCallback: reconnect.NewCallbackManager(),
+		reconnectMetrics:  reconnect.NewMetrics(),
 	}
 
 	// Apply scanner config
@@ -500,14 +509,63 @@ func (b *Bridge) readLoop() {
 		default:
 		}
 
-		// If not connected, try to connect
+		// If not connected, try to connect with exponential backoff
 		if b.conn == nil {
-			b.logInfo("[Bridge] ⚠️  Not connected, attempting to connect...")
+			if b.reconnectStrategy.HasReachedMax() {
+				b.logError("[Bridge] ❌ Max reconnection attempts reached, giving up")
+				b.stateManager.SetState(StateFailed, "max_attempts_reached")
+				b.reconnectCallback.Notify(reconnect.Event{
+					Type:      reconnect.EventMaxRetry,
+					Attempts:  b.reconnectStrategy.Attempts(),
+					Timestamp: time.Now(),
+					Layer:     "websocket",
+				})
+				return
+			}
+
+			delay := b.reconnectStrategy.NextDelay()
+			if delay > 0 {
+				b.logInfo("[Bridge] ⏳ Waiting %v before reconnection attempt %d/%d",
+					delay, b.reconnectStrategy.Attempts(), b.reconnectStrategy.MaxAttempts())
+				time.Sleep(delay)
+			}
+
+			b.stateManager.SetState(StateConnecting, "reconnect_attempt")
+			b.reconnectCallback.Notify(reconnect.Event{
+				Type:      reconnect.EventStarted,
+				Attempts:  b.reconnectStrategy.Attempts(),
+				Timestamp: time.Now(),
+				Layer:     "websocket",
+			})
+
+			startTime := time.Now()
 			if err := b.connect(); err != nil {
-				b.logInfo("[Bridge] ❌ Connection failed: %v, retrying in 5s...", err)
-				time.Sleep(5 * time.Second)
+				elapsed := time.Since(startTime)
+				b.logInfo("[Bridge] ❌ Connection failed (attempt %d/%d): %v",
+					b.reconnectStrategy.Attempts(), b.reconnectStrategy.MaxAttempts(), err)
+				b.reconnectMetrics.RecordAttempt(false, elapsed)
+				b.reconnectCallback.Notify(reconnect.Event{
+					Type:      reconnect.EventFailed,
+					Attempts:  b.reconnectStrategy.Attempts(),
+					Error:     err,
+					Timestamp: time.Now(),
+					Layer:     "websocket",
+				})
 				continue
 			}
+
+			// Connection successful
+			elapsed := time.Since(startTime)
+			b.reconnectMetrics.RecordAttempt(true, elapsed)
+			b.reconnectStrategy.Reset()
+			b.stateManager.SetState(StateConnected, "connection_established")
+			b.reconnectCallback.Notify(reconnect.Event{
+				Type:      reconnect.EventSuccess,
+				Attempts:  b.reconnectStrategy.Attempts(),
+				Timestamp: time.Now(),
+				Layer:     "websocket",
+			})
+
 			// Send device:online after successful connection
 			b.sendMessage(Message{
 				Type: "device:online",
@@ -517,12 +575,13 @@ func (b *Bridge) readLoop() {
 				},
 				Timestamp: time.Now().UnixMilli(),
 			})
-			b.logInfo("[Bridge] 📨 Sent device:online message")
+			b.logInfo("[Bridge] ✅ Connected successfully, sent device:online message")
 		}
 
 		_, data, err := b.conn.ReadMessage()
 		if err != nil {
 			b.logInfo("[Bridge] ❌ WebSocket read error: %v", err)
+			b.stateManager.SetState(StateDisconnected, "read_error")
 			b.reconnect()
 			continue
 		}
@@ -1101,32 +1160,21 @@ func (b *Bridge) heartbeat() {
 }
 
 func (b *Bridge) reconnect() {
-	b.logInfo("[Bridge] 🔄 Reconnecting...")
-	b.logInfo("[Bridge]   └─ Current connection state: conn=%v", b.conn != nil)
-	alert.WebSocketDisconnected("connection lost")
-	time.Sleep(5 * time.Second)
-
-	b.logInfo("[Bridge]   └─ Attempting to connect...")
-	err := b.connect()
-	b.logInfo("[Bridge]   └─ connect() returned: err=%v, conn=%v", err, b.conn != nil)
-
-	if err == nil && b.conn != nil {
-		b.logInfo("[Bridge]   └─ ✅ Reconnection successful!")
-		alert.WebSocketReconnected()
-
-		// Re-send device:online message after successful reconnection
-		b.sendMessage(Message{
-			Type: "device:online",
-			Payload: map[string]string{
-				"deviceId":   b.config.DeviceID,
-				"deviceName": getDeviceName(),
-			},
-			Timestamp: time.Now().UnixMilli(),
-		})
-		b.logInfo("[Bridge]   └─ 📨 Re-sent device:online message")
-	} else {
-		b.logInfo("[Bridge]   └─ ❌ Reconnection failed, will retry in readLoop")
+	// Close existing connection
+	b.mu.Lock()
+	if b.conn != nil {
+		b.conn.Close()
+		b.conn = nil
 	}
+	b.mu.Unlock()
+
+	b.stateManager.SetState(StateReconnecting, "initiating_reconnect")
+	alert.WebSocketDisconnected("connection lost")
+
+	b.logInfo("[Bridge] 🔄 Reconnecting (attempt %d/%d)...",
+		b.reconnectStrategy.Attempts()+1, b.reconnectStrategy.MaxAttempts())
+
+	// The actual reconnection will happen in readLoop with exponential backoff
 }
 
 func getDeviceName() string {
