@@ -36,3 +36,5 @@ Thumbs.db
 
 # 日志
 *.log
+# Output directory
+output/
