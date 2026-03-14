@@ -15,7 +15,10 @@ import (
 	"github.com/spf13/cobra"
 )
 
-var pairServerURL string
+var (
+	pairServerURL string
+	pairAutoStart  bool
+)
 
 // Default server URLs
 const (
@@ -109,12 +112,23 @@ Examples:
 		fmt.Printf("  Server: %s\n", cfg.ServerURL)
 		fmt.Println("  E2EE: Enabled")
 		fmt.Println()
-		fmt.Println("Run 'open-agents start' to start the bridge.")
+
+		// Auto-start if requested
+		if pairAutoStart {
+			fmt.Println("Starting bridge automatically...")
+			fmt.Println()
+			// Call startCmd directly
+			startCmd.Run(cmd, args)
+		} else {
+			fmt.Println("Run 'open-agents start' to start the bridge.")
+			fmt.Println("Tip: Use 'open-agents pair --auto-start' to start automatically after pairing.")
+		}
 	},
 }
 
 func init() {
-	pairCmd.Flags().StringVarP(&pairServerURL, "server", "s", "", "API server URL (default: staging server)")
+	pairCmd.Flags().StringVarP(&pairServerURL, "server", "s", "", "API server URL (default: production server)")
+	pairCmd.Flags().BoolVarP(&pairAutoStart, "auto-start", "a", false, "Automatically start bridge after pairing")
 }
 
 type PairResponse struct {
