@@ -5,8 +5,39 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
+	"time"
 )
 
+// DeviceConfig represents a single device configuration
+type DeviceConfig struct {
+	Name        string    `json:"name"`
+	UserID      string    `json:"userId"`
+	DeviceID    string    `json:"deviceId"`
+	DeviceToken string    `json:"deviceToken"`
+	ServerURL   string    `json:"serverUrl"`
+	PublicKey   string    `json:"publicKey,omitempty"`
+	PrivateKey  string    `json:"privateKey,omitempty"`
+	WebPubKey   string    `json:"webPubKey,omitempty"`
+	CreatedAt   time.Time `json:"createdAt"`
+	LastUsedAt  time.Time `json:"lastUsedAt,omitempty"`
+
+	// Device-specific settings (override global)
+	CLIEnabled  map[string]bool `json:"cliEnabled,omitempty"`
+	Permissions map[string]bool `json:"permissions,omitempty"`
+	LogLevel    string          `json:"logLevel,omitempty"`
+}
+
+// GlobalConfig represents the global configuration
+type GlobalConfig struct {
+	CurrentDevice   string                     `json:"currentDevice"`
+	DefaultServerURL string                    `json:"defaultServerUrl"`
+	CLIEnabled      map[string]bool            `json:"cliEnabled,omitempty"`
+	Permissions     map[string]bool            `json:"permissions,omitempty"`
+	LogLevel        string                     `json:"logLevel,omitempty"`
+}
+
+// Config is the legacy single-device config (for backward compatibility)
 type Config struct {
 	UserID      string `json:"userId"`
 	DeviceID    string `json:"deviceId"`
@@ -39,6 +70,42 @@ type Config struct {
 
 	// v2.3: Security scanner
 	ScannerEnabled *bool `json:"scannerEnabled,omitempty"` // nil = default (true)
+
+	// v2.4: Environment setting (optional, auto-detected if not set)
+	// Values: development, staging, production
+	Environment string `json:"environment,omitempty"`
+
+	// v2.5: Device name (for multi-device support)
+	DeviceName string `json:"deviceName,omitempty"`
+}
+
+// GetEnvironment returns the environment setting.
+// Priority: 1. Explicit Environment field in config
+//
+//  2. Auto-detect from ServerURL
+func (c *Config) GetEnvironment() string {
+	// If explicitly set in config, use that
+	if c.Environment != "" {
+		return c.Environment
+	}
+
+	// Auto-detect from ServerURL
+	if c.ServerURL == "" {
+		return "unknown"
+	}
+	// Check for staging indicators
+	if strings.Contains(c.ServerURL, "staging") ||
+		strings.Contains(c.ServerURL, "preview") ||
+		strings.Contains(c.ServerURL, "-staging") {
+		return "staging"
+	}
+	// Check for localhost
+	if strings.Contains(c.ServerURL, "localhost") ||
+		strings.Contains(c.ServerURL, "127.0.0.1") {
+		return "development"
+	}
+	// Default to production
+	return "production"
 }
 
 type ModelFallback struct {
@@ -125,6 +192,126 @@ func SaveScannerRules(rules interface{}) error {
 	data, err := json.MarshalIndent(wrapper, "", "  ")
 	if err != nil {
 		return err
-	}
+	 }
 	return os.WriteFile(filepath.Join(dir, "scanner-rules.json"), data, 0600)
+}
+
+// ============================================
+// Multi-Device Support
+// ============================================
+
+// DevicesDir returns the directory for device-specific configs
+func DevicesDir() string {
+	return filepath.Join(ConfigDir(), "devices")
+}
+
+// DeviceConfigPath returns the path to a device's config file
+func DeviceConfigPath(name string) string {
+	return filepath.Join(DevicesDir(), name+".json")
+}
+
+// ListDevices returns all configured device names
+func ListDevices() ([]string, error) {
+	dir := DevicesDir()
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		if os.IsNotExist(err) {
+		return []string{}, nil
+		}
+		return nil, err
+	}
+
+	var devices []string
+	for _, entry := range entries {
+		if !entry.IsDir() && strings.HasSuffix(entry.Name(), ".json") {
+			name := strings.TrimSuffix(entry.Name(), ".json")
+			devices = append(devices, name)
+		}
+	}
+	return devices, nil
+}
+
+// LoadDevice loads a specific device's config
+func LoadDevice(name string) (*Config, error) {
+	path := DeviceConfigPath(name)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+
+	var cfg Config
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		return nil, err
+	}
+
+	// Set device name if not set
+	if cfg.DeviceName == "" {
+		cfg.DeviceName = name
+	}
+
+	// Initialize maps if nil
+	if cfg.EnvVars == nil {
+		cfg.EnvVars = make(map[string]string)
+	}
+	if cfg.CLIEnabled == nil {
+		cfg.CLIEnabled = map[string]bool{"kiro": true, "claude": true, "cline": true, "codex": true, "gemini": true}
+	}
+	if cfg.Permissions == nil {
+		cfg.Permissions = map[string]bool{"fs_read": true, "fs_write": true, "execute_bash": true, "network": false}
+	}
+
+	return &cfg, nil
+}
+
+// SaveDevice saves a device's config
+func SaveDevice(name string, cfg *Config) error {
+	dir := DevicesDir()
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		return err
+	}
+
+	// Ensure device name is set
+	cfg.DeviceName = name
+
+	data, err := json.MarshalIndent(cfg, "", "  ")
+	if err != nil {
+		return err
+	}
+
+	return os.WriteFile(DeviceConfigPath(name), data, 0600)
+}
+
+// DeleteDevice removes a device's config
+func DeleteDevice(name string) error {
+	return os.Remove(DeviceConfigPath(name))
+}
+
+// GetCurrentDevice returns the current device name (from global config or env)
+func GetCurrentDevice() string {
+	// Check environment variable first
+	if name := os.Getenv("OPEN_AGENTS_DEVICE"); name != "" {
+		return name
+	}
+
+	// If only one device exists, use that
+	devices, _ := ListDevices()
+	if len(devices) == 1 {
+		return devices[0]
+	}
+
+	// Return empty if no current device set
+	return ""
+}
+
+// SetCurrentDevice sets the current device in global config
+func SetCurrentDevice(name string) error {
+	_ = name // For now, we use environment variable approach
+	// The caller should set OPEN_AGENTS_DEVICE env var
+	return nil
+}
+
+// DeviceExists checks if a device config exists
+func DeviceExists(name string) bool {
+	_, err := os.Stat(DeviceConfigPath(name))
+	return err == nil
 }

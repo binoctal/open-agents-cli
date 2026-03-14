@@ -9,6 +9,7 @@ Local Bridge 程序，连接 AI CLI 工具与 Open Agents 云端服务。
 - 端到端加密
 - 权限请求转发
 - 多会话管理
+- **多设备支持** - 一台机器可运行多个 bridge 实例
 - 跨平台支持 (Windows, Linux, macOS)
 
 ## 安装
@@ -31,19 +32,60 @@ make install
 ### 配对设备
 
 ```bash
-# 1. 在 Web 端点击"添加设备"获取配对码
-# 2. 运行配对命令
+# 交互式配对
 open-agents pair
+
+# 指定设备名称
+open-agents pair --name work-pc
+open-agents pair --name personal-laptop
+open-agents pair --name testing
+```
+
+### 管理设备
+
+```bash
+# 列出所有设备
+open-agents devices
+
+# 切换当前设备
+open-agents use work-pc
+
+# 查看设备详情
+open-agents device work-pc
 ```
 
 ### 启动 Bridge
 
 ```bash
-# 前台运行
+# 启动当前设备
 open-agents start
 
+# 启动指定设备
+open-agents start --device work-pc
+
+# 启动多个设备（不同终端）
+open-agents start --device work-pc
+open-agents start --device personal-laptop
+
+# 使用环境变量
+export OPEN_AGENTS_DEVICE=work-pc
+open-agents start
+
+# 启动时指定日志级别
+open-agents start --log-level debug
+```
+
+### 查看状态
+
+```bash
 # 查看状态
 open-agents status
+
+# 查看日志
+open-agents logs -f
+
+# 查看特定设备日志
+open-agents logs --device work-pc
 ```
 
 ### 安装为系统服务
@@ -64,17 +106,97 @@ open-agents service uninstall
 
 ## 配置文件
 
-配置文件位置：
-- Windows: `%APPDATA%\open-agents\config.json`
-- Linux/macOS: `~/.open-agents/config.json`
+### 目录结构
+
+```
+~/.open-agents/
+├── config.json           # 全局配置
+├── devices/              # 设备配置目录
+│   ├── work-pc.json
+│   ├── personal-laptop.json
+│   └── testing.json
+├── logs/
+│   ├── work-pc-2026-03-14.log
+│   └── personal-laptop-2026-03-14.log
+└── sessions/             # 会话数据
+```
+
+### 文件位置
+
+| 平台 | 配置目录 | 日志目录 |
+|------|----------|----------|
+| Linux | `~/.open-agents/` | `~/.open-agents/logs/` |
+| macOS | `~/.open-agents/` | `~/Library/Logs/open-agents/` |
+| Windows | `%APPDATA%\open-agents\` | `%APPDATA%\open-agents\logs\` |
+
+### 全局配置示例
 
 ```json
 {
-  "userId": "user_xxx",
+  "serverUrl": "wss://open-agents-api.binoctal.workers.dev",
+  "environment": "staging",
+  "logLevel": "info",
+  "cliEnabled": {
+    "claude": true,
+    "cline": true,
+    "codex": true,
+    "gemini": true,
+    "kiro": true
+  },
+  "permissions": {
+    "fs_read": true,
+    "fs_write": true,
+    "execute_bash": true,
+    "network": false
+  }
+}
+```
+
+### 设备配置示例
+
+```json
+{
+  "deviceName": "work-pc",
   "deviceId": "device_xxx",
   "deviceToken": "token_xxx",
-  "serverUrl": "wss://open-agents-realtime.workers.dev"
+  "userId": "user_xxx",
+  "publicKey": "...",
+  "privateKey": "..."
 }
+```
+
+### 环境自动检测
+
+| ServerURL 包含 | 检测结果 |
+|----------------|---------|
+| `staging`, `preview`, `-staging` | `staging` |
+| `localhost`, `127.0.0.1` | `development` |
+| 其他 | `production` |
+
+## 多设备场景
+
+### 场景 1: 工作与个人分离
+
+```bash
+# 配对两个设备
+open-agents pair --name work-pc      # 连接生产环境
+open-agents pair --name personal     # 连接测试环境
+
+# 同时运行两个 bridge
+open-agents start --device work-pc &
+open-agents start --device personal &
+```
+
+### 场景 2: 开发与测试
+
+```bash
+# 配对设备
+open-agents pair --name dev          # 日常开发
+open-agents pair --name testing      # 运行测试
+
+# 切换设备
+open-agents use dev
+open-agents start
 ```
 
 ## 支持的 CLI 工具
@@ -83,9 +205,9 @@ open-agents service uninstall
 |-----|------|
 | Kiro | ✅ 支持 |
 | Cline | ✅ 支持 |
-| Claude | 🚧 开发中 |
-| Codex | 🚧 开发中 |
-| Gemini | 🚧 开发中 |
+| Claude | ✅ 支持 |
+| Codex | ✅ 支持 |
+| Gemini | ✅ 支持 |
 
 ## 开发
 
@@ -108,14 +230,21 @@ make build-all
 ```
 bridge/
 ├── cmd/open-agents/     # CLI 入口
+│   ├── main.go
+│   ├── cmd_pair.go
+│   ├── cmd_start.go
+│   ├── cmd_devices.go
+│   └── cmd_use.go
 ├── internal/
 │   ├── adapter/         # CLI 适配器
 │   ├── bridge/          # 核心 Bridge 逻辑
 │   ├── config/          # 配置管理
+│   ├── logger/          # 日志系统
 │   └── session/         # 会话管理
 ├── go.mod
 ├── Makefile
-└── README.md
+├── README.md
+└── config.example.json
 ```
 
 ## License
