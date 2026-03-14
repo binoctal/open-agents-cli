@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"log"
 	"os"
 	"os/signal"
 	"syscall"
@@ -32,6 +33,11 @@ and control.`,
 			os.Exit(1)
 		}
 		defer l.Close()
+
+		// Redirect standard library log to custom logger
+		// This ensures all log.Printf calls use our log level and file output
+		log.SetOutput(l.Writer())
+		log.SetFlags(0) // Custom logger already adds timestamp
 
 		// Set log level from flag
 		logger.SetGlobalLevel(logLevel)
