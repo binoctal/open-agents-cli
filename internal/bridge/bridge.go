@@ -444,15 +444,8 @@ func (b *Bridge) Start() error {
 		return err
 	}
 
-	// Send device online message
-	b.sendMessage(Message{
-		Type: "device:online",
-		Payload: map[string]string{
-			"deviceId":   b.config.DeviceID,
-			"deviceName": getDeviceName(),
-		},
-		Timestamp: time.Now().UnixMilli(),
-	})
+	// Note: device:online message is sent by the server (room.ts) when bridge connects
+	// No need to send it here to avoid duplicate notifications
 
 	// Start message handler
 	go b.readLoop()
@@ -566,16 +559,8 @@ func (b *Bridge) readLoop() {
 				Layer:     "websocket",
 			})
 
-			// Send device:online after successful connection
-			b.sendMessage(Message{
-				Type: "device:online",
-				Payload: map[string]string{
-					"deviceId":   b.config.DeviceID,
-					"deviceName": getDeviceName(),
-				},
-				Timestamp: time.Now().UnixMilli(),
-			})
-			b.logInfo("[Bridge] ✅ Connected successfully, sent device:online message")
+			// Note: device:online message is sent by the server (room.ts) when bridge reconnects
+			b.logInfo("[Bridge] ✅ Connected successfully")
 		}
 
 		_, data, err := b.conn.ReadMessage()
