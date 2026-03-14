@@ -130,13 +130,17 @@ func (a *PTYAdapter) IsConnected() bool {
 }
 
 func (a *PTYAdapter) SendMessage(msg Message) error {
+	logger.Info("[PTY.SendMessage] Called: type=%s, connected=%v", msg.Type, a.connected.Load())
+
 	// For PTY, only content messages are supported
 	if msg.Type != MessageTypeContent {
+		logger.Info("[PTY.SendMessage] Ignoring non-content message type: %s", msg.Type)
 		return nil
 	}
 
 	content, ok := msg.Content.(string)
 	if !ok {
+		logger.Warn("[PTY.SendMessage] Invalid content type (expected string, got %T)", msg.Content)
 		return nil
 	}
 
@@ -144,11 +148,17 @@ func (a *PTYAdapter) SendMessage(msg Message) error {
 	defer a.mu.Unlock()
 
 	if a.ptmx == nil {
+		logger.Warn("[PTY.SendMessage] PTY not initialized (ptmx is nil)")
 		return nil
 	}
 
-	logger.Debug("[PTY] Sending: %q", content)
+	logger.Info("[PTY] Sending input: %q", content)
 	_, err := a.ptmx.Write([]byte(content + "\n"))
+	if err != nil {
+		logger.Error("[PTY] Send error: %v", err)
+	} else {
+		logger.Info("[PTY] Input sent successfully")
+	}
 	return err
 }
 

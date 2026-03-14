@@ -114,7 +114,14 @@ func (m *Manager) SendMessage(msg Message) error {
 	if m.adapter == nil {
 		return fmt.Errorf("no adapter connected")
 	}
-	return m.adapter.SendMessage(msg)
+	log.Printf("[Manager.SendMessage] Delegating to adapter: %s", m.adapter.Name())
+	err := m.adapter.SendMessage(msg)
+	if err != nil {
+		log.Printf("[Manager.SendMessage] Adapter returned error: %v", err)
+	} else {
+		log.Printf("[Manager.SendMessage] Adapter returned successfully")
+	}
+	return err
 }
 
 // Subscribe sets the message callback
