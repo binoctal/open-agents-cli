@@ -19,7 +19,7 @@ var pairServerURL string
 
 // Default server URLs
 const (
-	defaultAPIURL = "https://api.openagents.top"
+	defaultAPIURL = "https://open-agents-api.binoctal.workers.dev"
 	defaultWebURL = "https://openagents.top"
 )
 
