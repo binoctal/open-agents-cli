@@ -177,11 +177,36 @@ func (a *ACPAdapter) IsConnected() bool {
 }
 
 func (a *ACPAdapter) SendMessage(msg Message) error {
-	log.Printf("[ACP.SendMessage] Called: type=%s, connected=%v", msg.Type, a.connected.Load())
+	log.Printf("[ACP.SendMessage] Called: type=%s, connected=%v, sessionID=%s", msg.Type, a.connected.Load(), a.sessionID)
 
 	if !a.connected.Load() {
 		return fmt.Errorf("not connected")
 	}
+
+	// Check if sessionID is set for content messages
+	if a.sessionID == "" && msg.Type == MessageTypeContent {
+		log.Printf("[ACP.SendMessage] ERROR: sessionID is empty! Session may not be initialized.")
+		log.Printf("[ACP.SendMessage] Waiting up to 5 seconds for session initialization...")
+
+		// Wait for session initialization
+		timeout := time.After(5 * time.Second)
+		ticker := time.NewTicker(100 * time.Millisecond)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-timeout:
+				return fmt.Errorf("session not initialized: sessionID is empty after 5s timeout")
+			case <-ticker.C:
+				if a.sessionID != "" {
+					log.Printf("[ACP.SendMessage] Session initialized: %s", a.sessionID)
+					goto initialized
+				}
+			}
+		}
+	}
+
+initialized:
 
 	// Convert unified message to ACP JSON-RPC format
 	switch msg.Type {

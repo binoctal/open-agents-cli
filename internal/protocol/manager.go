@@ -38,8 +38,8 @@ func (m *Manager) Connect(config AdapterConfig) error {
 func (m *Manager) tryACP(config AdapterConfig) error {
 	adapter := NewACPAdapter()
 
-	// Wait for initialization (3 seconds timeout)
-	timeout := time.After(3 * time.Second)
+	// Wait for initialization (30 seconds timeout - increased for slow networks and first-time npx download)
+	timeout := time.After(30 * time.Second)
 	initialized := make(chan bool, 1)
 
 	// Subscribe to messages to detect initialization
