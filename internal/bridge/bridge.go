@@ -4,6 +4,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -1140,7 +1141,43 @@ func (b *Bridge) heartbeat() {
 			if b.conn != nil {
 				b.conn.WriteMessage(websocket.PingMessage, nil)
 			}
+			// Update last_seen via API heartbeat
+			go b.updateLastSeen()
 		}
+	}
+}
+
+// updateLastSeen sends a heartbeat to the API to update the device's last_seen timestamp
+func (b *Bridge) updateLastSeen() {
+	// Derive API URL from WebSocket URL
+	apiURL := b.config.ServerURL
+	if len(apiURL) > 3 && apiURL[:3] == "wss" {
+		apiURL = "https" + apiURL[3:]
+	} else if len(apiURL) > 2 && apiURL[:2] == "ws" {
+		apiURL = "http" + apiURL[2:]
+	}
+
+	url := fmt.Sprintf("%s/api/devices/%s/heartbeat", apiURL, b.config.DeviceID)
+
+	req, err := http.NewRequest("POST", url, nil)
+	if err != nil {
+		b.logDebug("Failed to create heartbeat request: %v", err)
+		return
+	}
+
+	req.Header.Set("Authorization", "Bearer "+b.config.DeviceToken)
+	req.Header.Set("Content-Type", "application/json")
+
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		b.logDebug("Heartbeat request failed: %v", err)
+		return
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		b.logDebug("Heartbeat returned status %d", resp.StatusCode)
 	}
 }
 
