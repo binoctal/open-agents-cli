@@ -20,31 +20,39 @@ func NewManager() *Manager {
 }
 
 // Connect attempts to connect using the best available protocol
+// For ACP-capable CLIs, we always prefer ACP and don't fallback to PTY
 func (m *Manager) Connect(config AdapterConfig) error {
 	logger.Info("[Protocol] Auto-detecting protocol for %s", config.Command)
 
-	// Try ACP first
-	if err := m.tryACP(config); err == nil {
+	// Try ACP first - this is the preferred protocol for Claude Code
+	err := m.tryACP(config)
+	if err == nil {
 		logger.Info("[Protocol] Using ACP protocol")
 		return nil
 	}
 
-	// Fallback to PTY
-	logger.Info("[Protocol] ACP failed, falling back to PTY")
+	// Only fallback to PTY if ACP process failed to start entirely
+	// (e.g., command not found, not ACP-capable CLI)
+	logger.Info("[Protocol] ACP failed (%v), falling back to PTY", err)
 	return m.tryPTY(config)
 }
 
 // tryACP attempts to connect using ACP protocol
+// Unlike before, we don't timeout once ACP process starts successfully
+// because ACP is the preferred protocol and may need authentication
 func (m *Manager) tryACP(config AdapterConfig) error {
 	adapter := NewACPAdapter()
 
-	// Wait for initialization (30 seconds timeout - increased for slow networks and first-time npx download)
-	timeout := time.After(30 * time.Second)
+	// Channel to receive initialization status
+	// We wait up to 60 seconds for initial connection, but once connected,
+	// we stay with ACP regardless of authentication status
 	initialized := make(chan bool, 1)
+	initError := make(chan error, 1)
 
 	// Subscribe to messages to detect initialization
 	originalCallback := m.callback
 	initCallback := func(msg Message) {
+		// Any status message means ACP is working
 		if msg.Type == MessageTypeStatus {
 			select {
 			case initialized <- true:
@@ -59,10 +67,15 @@ func (m *Manager) tryACP(config AdapterConfig) error {
 	// Set callback before connecting
 	adapter.Subscribe(initCallback)
 
+	// Attempt to connect
 	if err := adapter.Connect(config); err != nil {
+		// Connection failed entirely - CLI might not support ACP
+		initError <- err
 		return err
 	}
 
+	// Wait for initial handshake (60 seconds timeout for slow networks)
+	// This only waits for the ACP process to respond, not for full session setup
 	select {
 	case <-initialized:
 		m.adapter = adapter
@@ -73,9 +86,14 @@ func (m *Manager) tryACP(config AdapterConfig) error {
 		}
 		logger.Info("[Protocol] ACP initialized successfully")
 		return nil
-	case <-timeout:
+	case err := <-initError:
 		adapter.Disconnect()
-		return fmt.Errorf("ACP initialization timeout")
+		return fmt.Errorf("ACP connection failed: %w", err)
+	case <-time.After(60 * time.Second):
+		// Only timeout if ACP process doesn't respond at all
+		// This indicates the CLI doesn't support ACP
+		adapter.Disconnect()
+		return fmt.Errorf("ACP process did not respond within 60 seconds")
 	}
 }
 

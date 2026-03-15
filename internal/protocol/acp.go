@@ -1036,11 +1036,27 @@ func (a *ACPAdapter) handleResponse(msg map[string]interface{}) {
 		return
 	}
 
-	// Handle initialize response (contains agentInfo and capabilities)
+	// Handle initialize response (contains agentInfo, capabilities, and authMethods)
 	if agentInfo, ok := result["agentInfo"].(map[string]interface{}); ok {
 		name, _ := agentInfo["name"].(string)
 		version, _ := agentInfo["version"].(string)
 		logger.Info("[ACP] Connected to agent: %s v%s", name, version)
+
+		// Log available auth methods (informational only - not blocking)
+		// authMethods is just advertising available authentication options,
+		// not indicating that authentication is required.
+		// The agent can still process prompts if already authenticated.
+		if authMethods, ok := result["authMethods"].([]interface{}); ok && len(authMethods) > 0 {
+			logger.Debug("[ACP] Available auth methods: %d (informational)", len(authMethods))
+			// Log each method for debugging
+			for _, m := range authMethods {
+				if method, ok := m.(map[string]interface{}); ok {
+					methodID, _ := method["id"].(string)
+					methodName, _ := method["name"].(string)
+					logger.Debug("[ACP]   - %s: %s", methodID, methodName)
+				}
+			}
+		}
 		return
 	}
 }

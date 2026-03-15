@@ -72,6 +72,9 @@ type Bridge struct {
 	stateManager      *StateManager
 	reconnectCallback *reconnect.CallbackManager
 	reconnectMetrics  *reconnect.Metrics
+
+	// Message queue for ordered processing without blocking readLoop
+	messageQueue chan Message
 }
 
 func New(cfg *config.Config) (*Bridge, error) {
@@ -96,6 +99,7 @@ func New(cfg *config.Config) (*Bridge, error) {
 		stateManager:      NewStateManager(),
 		reconnectCallback: reconnect.NewCallbackManager(),
 		reconnectMetrics:  reconnect.NewMetrics(),
+		messageQueue:      make(chan Message, 100), // Buffered queue for ordered processing
 	}
 
 	// Apply scanner config
@@ -448,6 +452,9 @@ func (b *Bridge) Start() error {
 	// Note: device:online message is sent by the server (room.ts) when bridge connects
 	// No need to send it here to avoid duplicate notifications
 
+	// Start message worker for ordered processing
+	go b.messageWorker()
+
 	// Start message handler
 	go b.readLoop()
 
@@ -578,7 +585,27 @@ func (b *Bridge) readLoop() {
 			continue
 		}
 
-		b.handleMessage(msg)
+		// Queue message for ordered processing without blocking readLoop
+		// The messageWorker will process messages sequentially
+		select {
+		case b.messageQueue <- msg:
+			// Message queued successfully
+		case <-b.done:
+			return
+		}
+	}
+}
+
+// messageWorker processes messages from the queue sequentially
+// This ensures ordered processing while not blocking the readLoop
+func (b *Bridge) messageWorker() {
+	for {
+		select {
+		case <-b.done:
+			return
+		case msg := <-b.messageQueue:
+			b.handleMessage(msg)
+		}
 	}
 }
 
