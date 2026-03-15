@@ -196,7 +196,7 @@ func (c *Collector) RecordMessage(sessionID string) {
 	if session, ok := c.sessions[sessionID]; ok {
 		session.MessageCount++
 	}
-	c.IncrementCounter("messages.total", 1)
+	c.counters["messages.total"]++
 }
 
 // RecordTokenUsage records token usage for a session
@@ -211,8 +211,8 @@ func (c *Collector) RecordTokenUsage(sessionID string, input, output, cacheCreat
 		session.TokenUsage.CacheRead += cacheRead
 	}
 
-	c.IncrementCounter("tokens.input", input)
-	c.IncrementCounter("tokens.output", output)
+	c.counters["tokens.input"] += input
+	c.counters["tokens.output"] += output
 }
 
 // RecordPermission records a permission request
@@ -228,7 +228,7 @@ func (c *Collector) RecordPermission(sessionID string, approved bool) {
 	if approved {
 		status = "approved"
 	}
-	c.IncrementCounter("permissions."+status, 1)
+	c.counters["permissions."+status]++
 }
 
 // RecordError records an error
@@ -239,7 +239,7 @@ func (c *Collector) RecordError(sessionID string, errorType string) {
 	if session, ok := c.sessions[sessionID]; ok {
 		session.ErrorCount++
 	}
-	c.IncrementCounter("errors."+errorType, 1)
+	c.counters["errors."+errorType]++
 }
 
 // RecordToolCall records a tool call
@@ -250,7 +250,7 @@ func (c *Collector) RecordToolCall(sessionID string, toolName string) {
 	if session, ok := c.sessions[sessionID]; ok {
 		session.ToolCallCount++
 	}
-	c.IncrementCounter("tools."+toolName, 1)
+	c.counters["tools."+toolName]++
 }
 
 // GetSystemMetrics returns current system metrics

@@ -4,6 +4,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"os"
@@ -63,7 +64,8 @@ type Bridge struct {
 	keyPair           *crypto.KeyPair
 	webPubKey         *[crypto.KeySize]byte
 	done              chan struct{}
-	mu                sync.Mutex
+	connMu            sync.Mutex // protects conn read/write and conn lifecycle only
+	mu                sync.Mutex // protects other shared state (keyPair, webPubKey, etc.)
 	mcpManager        *mcpPkg.Manager
 	scanner           *scanner.Scanner
 	loopDetectors     map[string]*loopdetect.Detector
@@ -73,8 +75,15 @@ type Bridge struct {
 	reconnectCallback *reconnect.CallbackManager
 	reconnectMetrics  *reconnect.Metrics
 
+	// Permission ID -> Session ID mapping for precise routing
+	permSessionMap map[string]string
+	permSessionMu  sync.RWMutex
+
 	// Message queue for ordered processing without blocking readLoop
 	messageQueue chan Message
+
+	// HTTP client for API requests (reused to avoid connection reset issues)
+	httpClient *http.Client
 }
 
 func New(cfg *config.Config) (*Bridge, error) {
@@ -95,6 +104,7 @@ func New(cfg *config.Config) (*Bridge, error) {
 		done:              make(chan struct{}),
 		scanner:           scanner.New(),
 		loopDetectors:     make(map[string]*loopdetect.Detector),
+		permSessionMap:    make(map[string]string),
 		reconnectStrategy: reconnect.NewStrategy(),
 		stateManager:      NewStateManager(),
 		reconnectCallback: reconnect.NewCallbackManager(),
@@ -132,6 +142,17 @@ func New(cfg *config.Config) (*Bridge, error) {
 		b.webPubKey, _ = crypto.PublicKeyFromBase64(cfg.WebPubKey)
 	}
 
+	// Initialize HTTP client with connection pooling
+	b.httpClient = &http.Client{
+		Timeout: 10 * time.Second,
+		Transport: &http.Transport{
+			MaxIdleConns:        100,
+			MaxIdleConnsPerHost: 10,
+			IdleConnTimeout:     90 * time.Second,
+			DisableKeepAlives:   false, // Enable keep-alive
+		},
+	}
+
 	// Initialize metrics
 	metrics.Init(cfg.DeviceID, "1.0.0")
 
@@ -146,7 +167,10 @@ func New(cfg *config.Config) (*Bridge, error) {
 	metrics.RegisterHealthCheck("memory", metrics.MemoryHealthChecker(1024)) // 1GB max
 	metrics.RegisterHealthCheck("goroutines", metrics.GoroutineHealthChecker(1000))
 	metrics.RegisterHealthCheck("websocket", metrics.WebSocketHealthChecker(func() bool {
-		return b.conn != nil
+		b.connMu.Lock()
+		connected := b.conn != nil
+		b.connMu.Unlock()
+		return connected
 	}))
 
 	// ✅ Start session cleanup worker
@@ -204,247 +228,12 @@ func (b *Bridge) Start() error {
 	})
 
 	// Set up session output forwarding
+	// NOTE: outputCallback is called from ACP's readMessages goroutine.
+	// All sendMessage calls are dispatched asynchronously to avoid deadlock
+	// between logger mutex and bridge mutex across goroutines.
 	b.sessions.SetOutputCallback(func(sessionID string, msg protocol.Message) {
-		// Record metrics
-		metrics.RecordMessage(sessionID)
-
-		// Show content preview (first 50 chars)
-		var contentPreview string
-		if str, ok := msg.Content.(string); ok {
-			if len(str) > 50 {
-				contentPreview = str[:50] + "..."
-			} else {
-				contentPreview = str
-			}
-		} else {
-			contentPreview = fmt.Sprintf("%v", msg.Content)
-			if len(contentPreview) > 50 {
-				contentPreview = contentPreview[:50] + "..."
-			}
-		}
-		b.logInfo("[Bridge] Forwarding: session=%s, type=%s, content=\"%s\"", sessionID, msg.Type, contentPreview)
-
-		// Get session to check protocol
-		sess := b.sessions.Get(sessionID)
-		protocolName := "unknown"
-		if sess != nil {
-			protocolName = sess.GetProtocolName()
-		}
-
-		// Security scan output content
-		if contentStr, ok := msg.Content.(string); ok {
-			if alerts := b.scanner.Scan(contentStr); len(alerts) > 0 {
-				for _, a := range alerts {
-					b.sendMessage(Message{
-						Type: "security:alert",
-						Payload: map[string]interface{}{
-							"sessionId":   sessionID,
-							"deviceId":    b.config.DeviceID,
-							"category":    a.Category,
-							"level":       a.Level,
-							"ruleId":      a.RuleID,
-							"title":       a.Title,
-							"description": a.Description,
-							"match":       a.Match,
-						},
-						Timestamp: time.Now().UnixMilli(),
-					})
-				}
-				b.logInfo("[Scanner] %d alert(s) in session %s", len(alerts), sessionID)
-			}
-		}
-
-		switch msg.Type {
-		case protocol.MessageTypeContent:
-			// AI response content
-			b.sendMessage(Message{
-				Type: "chat:response",
-				Payload: map[string]interface{}{
-					"sessionId": sessionID,
-					"deviceId":  b.config.DeviceID,
-					"content":   msg.Content,
-					"protocol":  protocolName,
-				},
-				Timestamp: time.Now().UnixMilli(),
-			})
-
-		case protocol.MessageTypeThought:
-			// AI thinking process
-			b.sendMessage(Message{
-				Type: "chat:thought",
-				Payload: map[string]interface{}{
-					"sessionId": sessionID,
-					"deviceId":  b.config.DeviceID,
-					"content":   msg.Content,
-					"protocol":  protocolName,
-				},
-				Timestamp: time.Now().UnixMilli(),
-			})
-
-		case protocol.MessageTypeToolCall:
-			// Record tool call metric
-			metrics.RecordToolCall(sessionID, fmt.Sprintf("%v", msg.Content))
-
-			// Loop detection
-			toolName := fmt.Sprintf("%v", msg.Content)
-			if _, ok := b.loopDetectors[sessionID]; !ok {
-				b.loopDetectors[sessionID] = loopdetect.New(30, 5, 10)
-			}
-			if result := b.loopDetectors[sessionID].Record(toolName, toolName); result.Level > loopdetect.None {
-				b.logDebug("Loop detection [%s]: %s", sessionID, result.Message)
-				b.sendMessage(Message{
-					Type: "session:output",
-					Payload: map[string]interface{}{
-						"sessionId":  sessionID,
-						"outputType": "stderr",
-						"content":    fmt.Sprintf("⚠ %s", result.Message),
-					},
-					Timestamp: time.Now().UnixMilli(),
-				})
-			}
-
-			// Tool invocation
-			b.sendMessage(Message{
-				Type: "tool:call",
-				Payload: map[string]interface{}{
-					"sessionId": sessionID,
-					"deviceId":  b.config.DeviceID,
-					"toolCall":  msg.Content,
-					"protocol":  protocolName,
-				},
-				Timestamp: time.Now().UnixMilli(),
-			})
-
-		case protocol.MessageTypePermission:
-			// Permission request
-			permReq := msg.Content.(protocol.PermissionRequest)
-			b.sendMessage(Message{
-				Type: "permission:request",
-				Payload: map[string]interface{}{
-					"sessionId":   sessionID,
-					"deviceId":    b.config.DeviceID,
-					"id":          permReq.ID,
-					"toolName":    permReq.ToolName,
-					"toolInput":   permReq.ToolInput,
-					"description": permReq.Description,
-					"risk":        permReq.Risk,
-					"options":     permReq.Options,
-					"protocol":    protocolName,
-				},
-				Timestamp: time.Now().UnixMilli(),
-			})
-
-		case protocol.MessageTypeStatus:
-			// Agent status change
-			b.sendMessage(Message{
-				Type: "agent:status",
-				Payload: map[string]interface{}{
-					"sessionId": sessionID,
-					"deviceId":  b.config.DeviceID,
-					"status":    msg.Content,
-					"protocol":  protocolName,
-				},
-				Timestamp: time.Now().UnixMilli(),
-			})
-
-		case protocol.MessageTypeUsage:
-			// Token usage statistics
-			usage, ok := msg.Content.(protocol.UsageStats)
-			if !ok {
-				b.logInfo("[Bridge] Invalid usage stats type")
-				return
-			}
-
-			// Record token usage metrics
-			metrics.RecordTokenUsage(sessionID, int64(usage.InputTokens), int64(usage.OutputTokens), int64(usage.CacheCreation), int64(usage.CacheRead))
-
-			b.sendMessage(Message{
-				Type: "session:usage",
-				Payload: map[string]interface{}{
-					"sessionId": sessionID,
-					"deviceId":  b.config.DeviceID,
-					"usage": map[string]interface{}{
-						"inputTokens":   usage.InputTokens,
-						"outputTokens":  usage.OutputTokens,
-						"cacheCreation": usage.CacheCreation,
-						"cacheRead":     usage.CacheRead,
-						"contextSize":   usage.ContextSize,
-					},
-					"protocol": protocolName,
-				},
-				Timestamp: time.Now().UnixMilli(),
-			})
-
-		case protocol.MessageTypePlan:
-			// Task plan
-			b.sendMessage(Message{
-				Type: "agent:plan",
-				Payload: map[string]interface{}{
-					"sessionId": sessionID,
-					"deviceId":  b.config.DeviceID,
-					"plan":      msg.Content,
-					"protocol":  protocolName,
-				},
-				Timestamp: time.Now().UnixMilli(),
-			})
-
-		case protocol.MessageTypeError:
-			// Record error metric
-			metrics.RecordError(sessionID, "protocol")
-
-			// Try model fallback
-			if b.config.ModelFallbacks != nil {
-				if sess := b.sessions.Get(sessionID); sess != nil {
-					fallback := b.sessions.GetFallbackCLI(sess.CLIType, toFallbackConfigs(b.config.ModelFallbacks))
-					if fallback != "" {
-						b.logInfo("Attempting fallback from %s to %s for session %s", sess.CLIType, fallback, sessionID)
-						b.sendMessage(Message{
-							Type: "session:output",
-							Payload: map[string]interface{}{
-								"sessionId":  sessionID,
-								"deviceId":   b.config.DeviceID,
-								"outputType": "stderr",
-								"content":    fmt.Sprintf("[fallback] %s failed, switching to %s", sess.CLIType, fallback),
-							},
-							Timestamp: time.Now().UnixMilli(),
-						})
-						_ = b.sessions.Stop(sessionID)
-						_, _ = b.sessions.CreateWithIDAndSize(fallback, sess.WorkDir, sessionID+"-fb", 120, 30, sess.PermissionMode)
-						break
-					}
-				}
-			}
-
-			// Error message
-			b.sendMessage(Message{
-				Type: "session:error",
-				Payload: map[string]interface{}{
-					"sessionId": sessionID,
-					"deviceId":  b.config.DeviceID,
-					"error":     msg.Content,
-					"protocol":  protocolName,
-				},
-				Timestamp: time.Now().UnixMilli(),
-			})
-
-		default:
-			// For PTY raw output, send as session:output
-			if protocolName == "pty" {
-				b.sendMessage(Message{
-					Type: "session:output",
-					Payload: map[string]interface{}{
-						"sessionId":  sessionID,
-						"deviceId":   b.config.DeviceID,
-						"outputType": "stdout",
-						"content":    msg.Content,
-						"protocol":   protocolName,
-					},
-					Timestamp: time.Now().UnixMilli(),
-				})
-			}
-		}
+		go b.forwardSessionOutput(sessionID, msg)
 	})
-
 	if err := b.connect(); err != nil {
 		return err
 	}
@@ -452,17 +241,25 @@ func (b *Bridge) Start() error {
 	// Note: device:online message is sent by the server (room.ts) when bridge connects
 	// No need to send it here to avoid duplicate notifications
 
+	b.logInfo("[Bridge] 🚀 Starting goroutines...")
+
 	// Start message worker for ordered processing
+	b.logInfo("[Bridge] 🚀 Launching messageWorker goroutine...")
 	go b.messageWorker()
 
 	// Start message handler
+	b.logInfo("[Bridge] 🚀 Launching readLoop goroutine...")
 	go b.readLoop()
 
 	// Start heartbeat
+	b.logInfo("[Bridge] 🚀 Launching heartbeat goroutine...")
 	go b.heartbeat()
+
+	b.logInfo("[Bridge] ✅ All goroutines started, entering main loop")
 
 	// Wait for shutdown
 	<-b.done
+	b.logInfo("[Bridge] 🛑 Shutdown signal received, stopping...")
 	return nil
 }
 
@@ -470,9 +267,11 @@ func (b *Bridge) Stop() {
 	close(b.done)
 	b.sessions.StopAll()
 	b.permServer.Stop()
+	b.connMu.Lock()
 	if b.conn != nil {
 		b.conn.Close()
 	}
+	b.connMu.Unlock()
 }
 
 func (b *Bridge) connect() error {
@@ -497,7 +296,9 @@ func (b *Bridge) connect() error {
 		return err
 	}
 
+	b.connMu.Lock()
 	b.conn = conn
+	b.connMu.Unlock()
 	b.logInfo("[Bridge] ✅ Connected to server successfully")
 	return nil
 }
@@ -571,6 +372,7 @@ func (b *Bridge) readLoop() {
 			b.logInfo("[Bridge] ✅ Connected successfully")
 		}
 
+		b.logInfo("[Bridge] 🔍 Waiting for message on WebSocket...")
 		_, data, err := b.conn.ReadMessage()
 		if err != nil {
 			b.logInfo("[Bridge] ❌ WebSocket read error: %v", err)
@@ -579,17 +381,21 @@ func (b *Bridge) readLoop() {
 			continue
 		}
 
+		b.logInfo("[Bridge] 📥 Received raw data: length=%d, data=%s", len(data), string(data))
+
 		var msg Message
 		if err := json.Unmarshal(data, &msg); err != nil {
 			b.logInfo("[Bridge] Failed to parse message: %v", err)
 			continue
 		}
 
+		b.logInfo("[Bridge] 📦 Parsed message: type=%s", msg.Type)
+
 		// Queue message for ordered processing without blocking readLoop
 		// The messageWorker will process messages sequentially
 		select {
 		case b.messageQueue <- msg:
-			// Message queued successfully
+			b.logInfo("[Bridge] ✅ Message queued successfully: type=%s", msg.Type)
 		case <-b.done:
 			return
 		}
@@ -599,16 +405,250 @@ func (b *Bridge) readLoop() {
 // messageWorker processes messages from the queue sequentially
 // This ensures ordered processing while not blocking the readLoop
 func (b *Bridge) messageWorker() {
+	defer func() {
+		if r := recover(); r != nil {
+			b.logError("[Bridge] ❌ messageWorker panic: %v, restarting...", r)
+			// Restart worker after panic
+			time.Sleep(time.Second)
+			go b.messageWorker()
+		}
+	}()
+
+	b.logInfo("[Bridge] ✅ messageWorker started and ready to process messages")
+
 	for {
 		select {
 		case <-b.done:
+			b.logInfo("[Bridge] messageWorker stopped due to shutdown")
 			return
 		case msg := <-b.messageQueue:
+			queueLen := len(b.messageQueue)
+			b.logInfo("[Bridge] 📤 messageWorker dequeued: type=%s (queue remaining: %d)", msg.Type, queueLen)
 			b.handleMessage(msg)
 		}
 	}
 }
 
+
+// forwardSessionOutput forwards protocol messages from CLI to WebSocket
+func (b *Bridge) forwardSessionOutput(sessionID string, msg protocol.Message) {
+	// Record metrics
+	metrics.RecordMessage(sessionID)
+
+	b.logInfo("[Bridge] Forwarding: session=%s, type=%s", sessionID, msg.Type)
+
+	// Get session to check protocol
+	sess := b.sessions.Get(sessionID)
+	protocolName := "unknown"
+	if sess != nil {
+		protocolName = sess.GetProtocolName()
+	}
+
+	// Security scan output content
+	if contentStr, ok := msg.Content.(string); ok {
+		if alerts := b.scanner.Scan(contentStr); len(alerts) > 0 {
+			for _, a := range alerts {
+				b.sendMessage(Message{
+					Type: "security:alert",
+					Payload: map[string]interface{}{
+						"sessionId":   sessionID,
+						"deviceId":    b.config.DeviceID,
+						"category":    a.Category,
+						"level":       a.Level,
+						"ruleId":      a.RuleID,
+						"title":       a.Title,
+						"description": a.Description,
+						"match":       a.Match,
+					},
+					Timestamp: time.Now().UnixMilli(),
+				})
+			}
+			b.logInfo("[Scanner] %d alert(s) in session %s", len(alerts), sessionID)
+		}
+	}
+
+	switch msg.Type {
+	case protocol.MessageTypeContent:
+		b.sendMessage(Message{
+			Type: "chat:response",
+			Payload: map[string]interface{}{
+				"sessionId": sessionID,
+				"deviceId":  b.config.DeviceID,
+				"content":   msg.Content,
+				"protocol":  protocolName,
+			},
+			Timestamp: time.Now().UnixMilli(),
+		})
+
+	case protocol.MessageTypeThought:
+		b.sendMessage(Message{
+			Type: "chat:thought",
+			Payload: map[string]interface{}{
+				"sessionId": sessionID,
+				"deviceId":  b.config.DeviceID,
+				"content":   msg.Content,
+				"protocol":  protocolName,
+			},
+			Timestamp: time.Now().UnixMilli(),
+		})
+
+	case protocol.MessageTypeToolCall:
+		metrics.RecordToolCall(sessionID, fmt.Sprintf("%v", msg.Content))
+
+		toolName := fmt.Sprintf("%v", msg.Content)
+		if _, ok := b.loopDetectors[sessionID]; !ok {
+			b.loopDetectors[sessionID] = loopdetect.New(30, 5, 10)
+		}
+		if result := b.loopDetectors[sessionID].Record(toolName, toolName); result.Level > loopdetect.None {
+			b.logDebug("Loop detection [%s]: %s", sessionID, result.Message)
+			b.sendMessage(Message{
+				Type: "session:output",
+				Payload: map[string]interface{}{
+					"sessionId":  sessionID,
+					"outputType": "stderr",
+					"content":    fmt.Sprintf("⚠ %s", result.Message),
+				},
+				Timestamp: time.Now().UnixMilli(),
+			})
+		}
+
+		b.sendMessage(Message{
+			Type: "tool:call",
+			Payload: map[string]interface{}{
+				"sessionId": sessionID,
+				"deviceId":  b.config.DeviceID,
+				"toolCall":  msg.Content,
+				"protocol":  protocolName,
+			},
+			Timestamp: time.Now().UnixMilli(),
+		})
+
+	case protocol.MessageTypePermission:
+		permReq := msg.Content.(protocol.PermissionRequest)
+
+		permIDStr := fmt.Sprintf("%v", permReq.ID)
+		b.permSessionMu.Lock()
+		b.permSessionMap[permIDStr] = sessionID
+		b.permSessionMu.Unlock()
+
+		b.sendMessage(Message{
+			Type: "permission:request",
+			Payload: map[string]interface{}{
+				"sessionId":   sessionID,
+				"deviceId":    b.config.DeviceID,
+				"id":          permReq.ID,
+				"toolName":    permReq.ToolName,
+				"toolInput":   permReq.ToolInput,
+				"description": permReq.Description,
+				"risk":        permReq.Risk,
+				"options":     permReq.Options,
+				"protocol":    protocolName,
+			},
+			Timestamp: time.Now().UnixMilli(),
+		})
+
+	case protocol.MessageTypeStatus:
+		b.sendMessage(Message{
+			Type: "agent:status",
+			Payload: map[string]interface{}{
+				"sessionId": sessionID,
+				"deviceId":  b.config.DeviceID,
+				"status":    msg.Content,
+				"protocol":  protocolName,
+			},
+			Timestamp: time.Now().UnixMilli(),
+		})
+
+	case protocol.MessageTypeUsage:
+		usage, ok := msg.Content.(protocol.UsageStats)
+		if !ok {
+			b.logInfo("[Bridge] Invalid usage stats type")
+			return
+		}
+
+		metrics.RecordTokenUsage(sessionID, int64(usage.InputTokens), int64(usage.OutputTokens), int64(usage.CacheCreation), int64(usage.CacheRead))
+
+		b.sendMessage(Message{
+			Type: "session:usage",
+			Payload: map[string]interface{}{
+				"sessionId": sessionID,
+				"deviceId":  b.config.DeviceID,
+				"usage": map[string]interface{}{
+					"inputTokens":   usage.InputTokens,
+					"outputTokens":  usage.OutputTokens,
+					"cacheCreation": usage.CacheCreation,
+					"cacheRead":     usage.CacheRead,
+					"contextSize":   usage.ContextSize,
+				},
+				"protocol": protocolName,
+			},
+			Timestamp: time.Now().UnixMilli(),
+		})
+
+	case protocol.MessageTypePlan:
+		b.sendMessage(Message{
+			Type: "agent:plan",
+			Payload: map[string]interface{}{
+				"sessionId": sessionID,
+				"deviceId":  b.config.DeviceID,
+				"plan":      msg.Content,
+				"protocol":  protocolName,
+			},
+			Timestamp: time.Now().UnixMilli(),
+		})
+
+	case protocol.MessageTypeError:
+		metrics.RecordError(sessionID, "protocol")
+
+		if b.config.ModelFallbacks != nil {
+			if sess := b.sessions.Get(sessionID); sess != nil {
+				fallback := b.sessions.GetFallbackCLI(sess.CLIType, toFallbackConfigs(b.config.ModelFallbacks))
+				if fallback != "" {
+					b.logInfo("Attempting fallback from %s to %s for session %s", sess.CLIType, fallback, sessionID)
+					b.sendMessage(Message{
+						Type: "session:output",
+						Payload: map[string]interface{}{
+							"sessionId":  sessionID,
+							"deviceId":   b.config.DeviceID,
+							"outputType": "stderr",
+							"content":    fmt.Sprintf("[fallback] %s failed, switching to %s", sess.CLIType, fallback),
+						},
+						Timestamp: time.Now().UnixMilli(),
+					})
+					_ = b.sessions.Stop(sessionID)
+					_, _ = b.sessions.CreateWithIDAndSize(fallback, sess.WorkDir, sessionID+"-fb", 120, 30, sess.PermissionMode)
+					return
+				}
+			}
+		}
+
+		b.sendMessage(Message{
+			Type: "session:error",
+			Payload: map[string]interface{}{
+				"sessionId": sessionID,
+				"deviceId":  b.config.DeviceID,
+				"error":     msg.Content,
+				"protocol":  protocolName,
+			},
+			Timestamp: time.Now().UnixMilli(),
+		})
+
+	default:
+		if protocolName == "pty" {
+			b.sendMessage(Message{
+				Type: "session:output",
+				Payload: map[string]interface{}{
+					"sessionId":  sessionID,
+					"deviceId":   b.config.DeviceID,
+					"outputType": "stdout",
+					"content":    msg.Content,
+					"protocol":   protocolName,
+				},
+				Timestamp: time.Now().UnixMilli(),
+			})
+		}
+	}
+}
 func (b *Bridge) handleMessage(msg Message) {
 	b.logInfo("[Bridge] Received message type: %s, payload: %+v", msg.Type, msg.Payload)
 	switch msg.Type {
@@ -743,7 +783,6 @@ func (b *Bridge) handleSessionStart(msg Message) {
 		Timestamp: time.Now().UnixMilli(),
 	})
 
-	// Start session metrics
 	metrics.StartSession(sess.ID)
 
 	// Send initial command if provided
@@ -753,15 +792,31 @@ func (b *Bridge) handleSessionStart(msg Message) {
 }
 
 func (b *Bridge) handleSessionSend(msg Message) {
+	b.logInfo("[Bridge] 📨 handleSessionSend called")
+
+	// Step 1: Validate payload type
 	payload, ok := msg.Payload.(map[string]interface{})
 	if !ok {
+		b.logError("[Bridge] ❌ handleSessionSend: invalid payload type, got %T", msg.Payload)
 		return
 	}
+	b.logInfo("[Bridge] ✅ Payload validation passed")
 
-	sessionID, _ := payload["sessionId"].(string)
-	content, _ := payload["content"].(string)
+	// Step 2: Extract parameters
+	sessionID, ok := payload["sessionId"].(string)
+	if !ok {
+		b.logError("[Bridge] ❌ sessionId missing or invalid type")
+		return
+	}
+	content, ok := payload["content"].(string)
+	if !ok {
+		b.logError("[Bridge] ❌ content missing or invalid type")
+		return
+	}
+	b.logInfo("[Bridge] 📋 Parameters extracted: sessionID=%s, contentLength=%d, content=\"%s\"",
+		sessionID, len(content), content)
 
-	// Scan input direction for security issues
+	// Step 3: Security scanning
 	if alerts := b.scanner.ScanWithDirection(content, scanner.DirInput); len(alerts) > 0 {
 		for _, a := range alerts {
 			b.sendMessage(Message{
@@ -780,17 +835,48 @@ func (b *Bridge) handleSessionSend(msg Message) {
 				Timestamp: time.Now().UnixMilli(),
 			})
 		}
-		b.logInfo("[Scanner] %d input alert(s) in session %s", len(alerts), sessionID)
+		b.logWarn("[Scanner] ⚠️ %d input alert(s) in session %s", len(alerts), sessionID)
 	}
 
+	// Step 4: Get session
+	b.logInfo("[Bridge] 🔍 Looking up session: %s", sessionID)
 	sess := b.sessions.Get(sessionID)
 	if sess == nil {
-		b.logInfo("Session not found: %s", sessionID)
+		b.logError("[Bridge] ❌ Session not found: %s", sessionID)
+		b.logInfo("[Bridge] 📊 Active sessions: %d", b.sessions.ActiveCount())
+		// List all active sessions for debugging
+		allSessions := b.sessions.List()
+		for _, s := range allSessions {
+			b.logInfo("[Bridge]   - Session ID: %s, CLI: %s, Status: %s", s.ID, s.CLIType, s.Status)
+		}
 		return
 	}
+	b.logInfo("[Bridge] ✅ Session found: ID=%s, CLI=%s, Protocol=%s, Status=%s",
+		sess.ID, sess.CLIType, sess.GetProtocolName(), sess.Status)
 
+	// Step 5: Check if session protocol is ready
+	if sess.Protocol == nil {
+		b.logError("[Bridge] ❌ Session protocol is nil for session %s", sessionID)
+		return
+	}
+	b.logInfo("[Bridge] ✅ Session protocol ready: %s", sess.GetProtocolName())
+
+	// Step 6: Send message to CLI
+	b.logInfo("[Bridge] 📤 Calling sess.Send() with content length: %d", len(content))
 	if err := sess.Send(content); err != nil {
-		b.logInfo("Send error: %v", err)
+		b.logError("[Bridge] ❌ Send error: %v", err)
+		// Send error notification back to web
+		b.sendMessage(Message{
+			Type: "session:error",
+			Payload: map[string]interface{}{
+				"sessionId": sessionID,
+				"deviceId":  b.config.DeviceID,
+				"error":     fmt.Sprintf("Failed to send message: %v", err),
+			},
+			Timestamp: time.Now().UnixMilli(),
+		})
+	} else {
+		b.logInfo("[Bridge] ✅ Message sent successfully to CLI")
 	}
 }
 
@@ -914,10 +1000,15 @@ func (b *Bridge) handlePermissionResponse(msg Message) {
 
 	// Also send to ACP protocol if optionId is provided
 	if optionID != "" {
-		// Find session by permission ID (stored in permission handler)
-		// For now, send to all active sessions
-		for _, sess := range b.sessions.List() {
-			if sess.Protocol != nil && sess.Protocol.GetProtocolName() == "acp" {
+		// Look up the exact session for this permission ID
+		b.permSessionMu.RLock()
+		targetSessionID := b.permSessionMap[idStr]
+		b.permSessionMu.RUnlock()
+
+		if targetSessionID != "" {
+			// Route to the specific session
+			sess := b.sessions.Get(targetSessionID)
+			if sess != nil && sess.Protocol != nil && sess.Protocol.GetProtocolName() == "acp" {
 				b.logInfo("[Bridge] Sending permission response to ACP session: %s", sess.ID)
 				sess.Protocol.SendMessage(protocol.Message{
 					Type: protocol.MessageTypePermission,
@@ -926,6 +1017,26 @@ func (b *Bridge) handlePermissionResponse(msg Message) {
 						OptionID: optionID,
 					},
 				})
+			}
+
+			// Clean up mapping
+			b.permSessionMu.Lock()
+			delete(b.permSessionMap, idStr)
+			b.permSessionMu.Unlock()
+		} else {
+			// Fallback: send to all ACP sessions (backward compatibility)
+			b.logInfo("[Bridge] No session mapping for permission %s, broadcasting to all ACP sessions", idStr)
+			for _, sess := range b.sessions.List() {
+				if sess.Protocol != nil && sess.Protocol.GetProtocolName() == "acp" {
+					b.logInfo("[Bridge] Sending permission response to ACP session: %s", sess.ID)
+					sess.Protocol.SendMessage(protocol.Message{
+						Type: protocol.MessageTypePermission,
+						Content: protocol.PermissionResponse{
+							ID:       id,
+							OptionID: optionID,
+						},
+					})
+				}
 			}
 		}
 	}
@@ -1121,39 +1232,54 @@ func (b *Bridge) handleChatSend(msg Message) {
 }
 
 func (b *Bridge) sendMessage(msg Message) error {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-
-	if b.conn == nil {
-		b.logInfo("Offline: %s", msg.Type)
-		return nil
-	}
-
+	// Phase 1: Prepare data without any lock
 	data, err := json.Marshal(msg)
 	if err != nil {
 		return err
 	}
 
-	// Encrypt if E2EE is enabled and we have web's public key
-	if b.keyPair != nil && b.webPubKey != nil {
-		encrypted, err := b.keyPair.Encrypt(data, b.webPubKey)
-		if err != nil {
-			b.logInfo("Encryption failed: %v", err)
-			return b.conn.WriteMessage(websocket.TextMessage, data)
-		}
+	// Read encryption keys under mu (brief)
+	b.mu.Lock()
+	kp := b.keyPair
+	wpk := b.webPubKey
+	b.mu.Unlock()
 
-		envelope := Message{
-			Type: "encrypted",
-			Payload: map[string]string{
-				"data":   base64.StdEncoding.EncodeToString(encrypted),
-				"pubKey": b.keyPair.PublicKeyBase64(),
-			},
-			Timestamp: time.Now().UnixMilli(),
+	// Encrypt if E2EE is enabled
+	if kp != nil && wpk != nil {
+		encrypted, err := kp.Encrypt(data, wpk)
+		if err == nil {
+			envelope := Message{
+				Type: "encrypted",
+				Payload: map[string]string{
+					"data":   base64.StdEncoding.EncodeToString(encrypted),
+					"pubKey": kp.PublicKeyBase64(),
+				},
+				Timestamp: time.Now().UnixMilli(),
+			}
+			data, _ = json.Marshal(envelope)
 		}
-		data, _ = json.Marshal(envelope)
+		// On encrypt error, fall through and send unencrypted
 	}
 
-	return b.conn.WriteMessage(websocket.TextMessage, data)
+	// Phase 2: Write under connMu only
+	b.connMu.Lock()
+	if b.conn == nil {
+		b.connMu.Unlock()
+		b.logInfo("Offline: %s", msg.Type)
+		return nil
+	}
+	b.conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+	err = b.conn.WriteMessage(websocket.TextMessage, data)
+	if err != nil {
+		b.conn.Close()
+		b.conn = nil
+	}
+	b.connMu.Unlock()
+
+	if err != nil {
+		b.logError("[Bridge] WebSocket write failed: %v", err)
+	}
+	return err
 }
 
 func (b *Bridge) heartbeat() {
@@ -1165,9 +1291,12 @@ func (b *Bridge) heartbeat() {
 		case <-b.done:
 			return
 		case <-ticker.C:
+			b.connMu.Lock()
 			if b.conn != nil {
+				b.conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
 				b.conn.WriteMessage(websocket.PingMessage, nil)
 			}
+			b.connMu.Unlock()
 			// Update last_seen via API heartbeat
 			go b.updateLastSeen()
 		}
@@ -1195,13 +1324,17 @@ func (b *Bridge) updateLastSeen() {
 	req.Header.Set("Authorization", "Bearer "+b.config.DeviceToken)
 	req.Header.Set("Content-Type", "application/json")
 
-	client := &http.Client{Timeout: 10 * time.Second}
-	resp, err := client.Do(req)
+	// Use the reused HTTP client instead of creating a new one
+	resp, err := b.httpClient.Do(req)
 	if err != nil {
 		b.logDebug("Heartbeat request failed: %v", err)
 		return
 	}
 	defer resp.Body.Close()
+
+	// Read the entire response body to prevent connection reset
+	// This ensures the connection is properly closed after the server finishes writing
+	_, _ = io.ReadAll(resp.Body)
 
 	if resp.StatusCode != 200 {
 		b.logDebug("Heartbeat returned status %d", resp.StatusCode)
@@ -1210,12 +1343,12 @@ func (b *Bridge) updateLastSeen() {
 
 func (b *Bridge) reconnect() {
 	// Close existing connection
-	b.mu.Lock()
+	b.connMu.Lock()
 	if b.conn != nil {
 		b.conn.Close()
 		b.conn = nil
 	}
-	b.mu.Unlock()
+	b.connMu.Unlock()
 
 	b.stateManager.SetState(StateReconnecting, "initiating_reconnect")
 	alert.WebSocketDisconnected("connection lost")

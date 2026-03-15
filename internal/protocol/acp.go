@@ -44,12 +44,15 @@ type ACPAdapter struct {
 	// Token usage tracking (estimated)
 	inputTokens  atomic.Int64
 	outputTokens atomic.Int64
+	// Signal channels for initialization sequencing
+	initDone chan struct{} // closed when initialize response received
 }
 
 // NewACPAdapter creates a new ACP adapter
 func NewACPAdapter() *ACPAdapter {
 	return &ACPAdapter{
 		terminals: make(map[string]*terminalState),
+		initDone:  make(chan struct{}),
 	}
 }
 
@@ -185,21 +188,32 @@ func (a *ACPAdapter) SendMessage(msg Message) error {
 
 	// Check if sessionID is set for content messages
 	if a.sessionID == "" && msg.Type == MessageTypeContent {
-		log.Printf("[ACP.SendMessage] ERROR: sessionID is empty! Session may not be initialized.")
-		log.Printf("[ACP.SendMessage] Waiting up to 5 seconds for session initialization...")
+		log.Printf("[ACP.SendMessage] ⚠️  ERROR: sessionID is empty! Session may not be initialized.")
+		log.Printf("[ACP.SendMessage] 📝 Common causes:")
+		log.Printf("[ACP.SendMessage]    1. Claude CLI needs authentication - run: npx @zed-industries/claude-code-acp")
+		log.Printf("[ACP.SendMessage]    2. session/new request hasn't responded yet")
+		log.Printf("[ACP.SendMessage]    3. ACP process is starting up")
+		log.Printf("[ACP.SendMessage] ⏳ Waiting up to 30 seconds for session initialization...")
 
 		// Wait for session initialization
-		timeout := time.After(5 * time.Second)
+		timeout := time.After(30 * time.Second)
 		ticker := time.NewTicker(100 * time.Millisecond)
 		defer ticker.Stop()
 
+		waitStart := time.Now()
 		for {
 			select {
 			case <-timeout:
-				return fmt.Errorf("session not initialized: sessionID is empty after 5s timeout")
+				elapsed := time.Since(waitStart)
+				log.Printf("[ACP.SendMessage] ❌ Timeout after %v: sessionID still empty", elapsed)
+				log.Printf("[ACP.SendMessage] 💡 Solution: Please authenticate Claude CLI by running:")
+				log.Printf("[ACP.SendMessage]    npx @zed-industries/claude-code-acp")
+				log.Printf("[ACP.SendMessage]    (Follow the authentication prompts)")
+				return fmt.Errorf("session not initialized: sessionID is empty after 30s timeout. Claude CLI may need authentication")
 			case <-ticker.C:
 				if a.sessionID != "" {
-					log.Printf("[ACP.SendMessage] Session initialized: %s", a.sessionID)
+					elapsed := time.Since(waitStart)
+					log.Printf("[ACP.SendMessage] ✅ Session initialized after %v: %s", elapsed, a.sessionID)
 					goto initialized
 				}
 			}
@@ -337,11 +351,15 @@ func (a *ACPAdapter) initialize() error {
 		return err
 	}
 
-	// Step 2: Create a new session
-	// Note: session/new should be sent after initialize response
-	// but we send it immediately as the response handling is async
-	time.Sleep(100 * time.Millisecond) // Small delay to ensure initialize is processed
+	// Step 2: Wait for initialize response before sending session/new
+	select {
+	case <-a.initDone:
+		logger.Info("[ACP] Initialize response received, sending session/new")
+	case <-time.After(30 * time.Second):
+		return fmt.Errorf("timeout waiting for initialize response")
+	}
 
+	// Step 3: Create a new session
 	// Get absolute path for workDir
 	absWorkDir := a.workDir
 	if absWorkDir == "" || absWorkDir == "." {
@@ -407,14 +425,25 @@ func (a *ACPAdapter) readMessages() {
 	}
 }
 
-// readErrors reads stderr
+// readErrors reads stderr and forwards important messages
 func (a *ACPAdapter) readErrors() {
 	scanner := bufio.NewScanner(a.stderr)
 	for scanner.Scan() {
 		if !a.connected.Load() {
 			break
 		}
-		log.Printf("[ACP stderr] %s", scanner.Text())
+		line := scanner.Text()
+		log.Printf("[ACP stderr] %s", line)
+
+		// Forward stderr to Web UI as error messages
+		a.emitMessage(Message{
+			Type:    MessageTypeError,
+			Content: line,
+			Meta: map[string]interface{}{
+				"protocol": "acp",
+				"source":   "stderr",
+			},
+		})
 	}
 }
 
@@ -462,21 +491,28 @@ func (a *ACPAdapter) handleSessionUpdate(msg map[string]interface{}) {
 		return
 	}
 
+	// Collect all updates to process
+	var updates []map[string]interface{}
+
 	// Handle single update format (used by claude-code-acp)
-	update, ok := params["update"].(map[string]interface{})
-	if !ok {
-		// Try array format
-		updates, ok := params["updates"].([]interface{})
-		if !ok {
-			return
-		}
-		if len(updates) > 0 {
-			update, ok = updates[0].(map[string]interface{})
-			if !ok {
-				return
+	if update, ok := params["update"].(map[string]interface{}); ok {
+		updates = append(updates, update)
+	} else if updatesArr, ok := params["updates"].([]interface{}); ok {
+		// Handle array format - process ALL updates
+		for _, u := range updatesArr {
+			if update, ok := u.(map[string]interface{}); ok {
+				updates = append(updates, update)
 			}
 		}
 	}
+
+	for _, update := range updates {
+		a.processSessionUpdate(update)
+	}
+}
+
+// processSessionUpdate processes a single session update entry
+func (a *ACPAdapter) processSessionUpdate(update map[string]interface{}) {
 
 	// Get update type - ACP uses "sessionUpdate" field
 	updateType, _ := update["sessionUpdate"].(string)
@@ -1023,14 +1059,16 @@ func (a *ACPAdapter) handleResponse(msg map[string]interface{}) {
 	// Handle session/new response (contains sessionId)
 	if sessionID, ok := result["sessionId"].(string); ok {
 		a.sessionID = sessionID
-		logger.Info("[ACP] Session created: %s", sessionID)
+		logger.Info("[ACP] ✅ Session created: %s", sessionID)
+		log.Printf("[ACP] ✅ Session ready! You can now send messages to Claude CLI")
 
 		// Send initialized/ready status to signal successful initialization
 		a.emitMessage(Message{
 			Type:    MessageTypeStatus,
 			Content: StatusIdle,
 			Meta: map[string]interface{}{
-				"protocol": "acp",
+				"protocol":  "acp",
+				"sessionId": sessionID,
 			},
 		})
 		return
@@ -1041,14 +1079,11 @@ func (a *ACPAdapter) handleResponse(msg map[string]interface{}) {
 		name, _ := agentInfo["name"].(string)
 		version, _ := agentInfo["version"].(string)
 		logger.Info("[ACP] Connected to agent: %s v%s", name, version)
+		log.Printf("[ACP] ✅ Initialize successful, waiting for session/new response...")
 
 		// Log available auth methods (informational only - not blocking)
-		// authMethods is just advertising available authentication options,
-		// not indicating that authentication is required.
-		// The agent can still process prompts if already authenticated.
 		if authMethods, ok := result["authMethods"].([]interface{}); ok && len(authMethods) > 0 {
 			logger.Debug("[ACP] Available auth methods: %d (informational)", len(authMethods))
-			// Log each method for debugging
 			for _, m := range authMethods {
 				if method, ok := m.(map[string]interface{}); ok {
 					methodID, _ := method["id"].(string)
@@ -1056,6 +1091,14 @@ func (a *ACPAdapter) handleResponse(msg map[string]interface{}) {
 					logger.Debug("[ACP]   - %s: %s", methodID, methodName)
 				}
 			}
+		}
+
+		// Signal that initialize is done so session/new can be sent
+		select {
+		case <-a.initDone:
+			// already closed
+		default:
+			close(a.initDone)
 		}
 		return
 	}

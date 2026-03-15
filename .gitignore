@@ -38,3 +38,5 @@ Thumbs.db
 *.log
 # Output directory
 output/
+config.json
+open-agents-bridge
